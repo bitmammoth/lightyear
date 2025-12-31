@@ -231,6 +231,19 @@ pub fn has_server_role(server_role: Option<Res<ServerRole>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_app::App;
+    use crate::client::PeerMetadata;
+    use lightyear_link::prelude::Server;
+
+    /// Helper to create an app with required resources for testing
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(ServerRolePlugin);
+        // PeerMetadata is required by Started/Stopped hooks
+        app.init_resource::<PeerMetadata>();
+        app.update();
+        app
+    }
 
     #[test]
     fn test_server_role_default() {
@@ -245,5 +258,113 @@ mod tests {
         assert_eq!(IoServer::udp().transport_name, "UDP");
         assert_eq!(IoServer::steam().transport_name, "Steam");
         assert_eq!(IoServer::webtransport().transport_name, "WebTransport");
+    }
+
+    #[test]
+    fn test_server_role_plugin_initializes_resource() {
+        let app = test_app();
+
+        let server_role = app.world().resource::<ServerRole>();
+        assert_eq!(server_role.state, ServerRoleState::Stopped);
+    }
+
+    #[test]
+    fn test_server_role_transitions_to_running_on_started() {
+        let mut app = test_app();
+
+        // Initially stopped
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Stopped
+        );
+
+        // Spawn a Server entity with Started component
+        app.world_mut().spawn((Server::default(), crate::server::Started));
+        app.update();
+
+        // Should now be running
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Running
+        );
+    }
+
+    #[test]
+    fn test_server_role_stays_running_with_multiple_servers() {
+        let mut app = test_app();
+
+        // Spawn two Server entities with Started
+        let server1 = app
+            .world_mut()
+            .spawn((Server::default(), crate::server::Started))
+            .id();
+        app.world_mut()
+            .spawn((Server::default(), crate::server::Started));
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Running
+        );
+
+        // Stop one server - should still be running
+        app.world_mut()
+            .entity_mut(server1)
+            .remove::<crate::server::Started>()
+            .insert(crate::server::Stopped);
+        app.update();
+
+        // Still running because server2 is still started
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Running
+        );
+    }
+
+    #[test]
+    fn test_server_role_transitions_to_stopped_when_all_stopped() {
+        let mut app = test_app();
+
+        // Spawn a Server entity with Started
+        let server = app
+            .world_mut()
+            .spawn((Server::default(), crate::server::Started))
+            .id();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Running
+        );
+
+        // Stop the server
+        app.world_mut()
+            .entity_mut(server)
+            .remove::<crate::server::Started>()
+            .insert(crate::server::Stopped);
+        app.update();
+
+        // Should now be stopped
+        assert_eq!(
+            app.world().resource::<ServerRole>().state,
+            ServerRoleState::Stopped
+        );
+    }
+
+    #[test]
+    fn test_run_conditions() {
+        let app = test_app();
+
+        // Test has_server_role - should be true after plugin added
+        let world = app.world();
+        let has_role = world.get_resource::<ServerRole>().is_some();
+        assert!(has_role);
+
+        // Test is_server_running - should be false initially
+        let is_running = world
+            .get_resource::<ServerRole>()
+            .map(|r| r.is_running())
+            .unwrap_or(false);
+        assert!(!is_running);
     }
 }
