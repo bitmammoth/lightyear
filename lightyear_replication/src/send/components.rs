@@ -398,6 +398,15 @@ impl<T: ReplicationTargetT> ReplicationTarget<T> {
         Self::new(ReplicationMode::SingleServer(target))
     }
 
+    /// Target all clients matching the NetworkTarget, regardless of which server they're connected to.
+    /// 
+    /// This is useful for multi-transport setups where you want prediction/interpolation to work
+    /// across all transports (e.g., UDP + WebTransport).
+    #[cfg(feature = "server")]
+    pub fn to_all(target: NetworkTarget) -> Self {
+        Self::new(ReplicationMode::Target(target))
+    }
+
     // TODO: small vec
     pub fn manual(senders: Vec<Entity>) -> Self {
         Self::new(ReplicationMode::Manual(senders))
@@ -535,10 +544,32 @@ impl<T: ReplicationTargetT> ReplicationTarget<T> {
                         },
                     );
                 }
-                ReplicationMode::Target(_) => {
-                    todo!(
-                        "need a global mapping from remote_peer to corresponding replication_sender"
-                    )
+                #[cfg(feature = "server")]
+                ReplicationMode::Target(target) => {
+                    // Target mode: replicate to all matching ReplicationSender entities regardless of which server they're connected to.
+                    // This is useful for multi-transport setups where you want a unified world across all transports.
+                    use lightyear_connection::client_of::ClientOf;
+                    let peer_metadata = world.resource::<PeerMetadata>();
+                    
+                    // Query all clients with ReplicationSender
+                    for (client_entity, remote_id, is_host_client) in world
+                        .query_filtered::<(Entity, &RemoteId, Has<HostClient>), (With<ClientOf>, Or<(With<ReplicationSender>, With<HostClient>)>)>()
+                        .iter(world)
+                    {
+                        // Check if this client matches the target
+                        if target.targets(&remote_id) {
+                            trace!(
+                                "Adding ReplicationTarget<{}>, entity {} to ClientOf {} via Target mode",
+                                DebugName::type_name::<T>(),
+                                context.entity,
+                                client_entity
+                            );
+                            T::update_replicate_state(state.per_sender_state.entry(client_entity).or_default());
+                            if is_host_client {
+                                add_host_client = true;
+                            }
+                        }
+                    }
                 }
                 ReplicationMode::Manual(sender_entities) => {
                     for sender_entity in sender_entities.iter() {
@@ -586,6 +617,7 @@ pub enum ReplicationMode {
     #[cfg(feature = "server")]
     /// Will use all the clients for that server entity
     Server(Entity, NetworkTarget),
+    #[cfg(feature = "server")]
     /// Will assign to various ReplicationSenders to replicate to
     /// all peers in the NetworkTarget
     Target(NetworkTarget),
@@ -601,8 +633,8 @@ pub enum ReplicationMode {
 /// # use bevy_ecs::prelude::*;
 /// # use lightyear_replication::prelude::{NetworkVisibility, Replicate, ReplicationState};
 /// # let mut world = World::new();
-/// # let entity = world.spawn((ReplicationState::default(), NetworkVisibility));
-/// # let mut sender = world.spawn_empty();
+/// # let entity = world.spawn((ReplicationState::default(), NetworkVisibility)).id();
+/// # let sender = world.spawn_empty().id();
 /// let mut state = world.get_mut::<ReplicationState>(entity).unwrap();
 /// // the entity will now be visible (replicated) on that sender
 /// state.gain_visibility(sender);
@@ -1020,6 +1052,7 @@ impl Replicate {
                         },
                     );
                 }
+                #[cfg(feature = "server")]
                 ReplicationMode::Target(target) => {
                     // Target mode: replicate to all matching ReplicationSender entities regardless of which server they're connected to.
                     // This is useful for multi-transport setups where you want a unified world across all transports.
@@ -1215,6 +1248,7 @@ impl Replicate {
                                     f(state, entity, sender_entity, &mut commands);
                                 }
                             }
+                            #[cfg(feature = "server")]
                             ReplicationMode::Target(target) => {
                                 if target.targets(remote_peer_id) {
                                     f(state, entity, sender_entity, &mut commands);
