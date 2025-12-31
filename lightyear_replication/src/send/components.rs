@@ -782,6 +782,61 @@ impl Replicate {
         }
     }
 
+    /// Replicate to clients connected through a specific server entity.
+    /// 
+    /// This is useful when running multiple server transports (e.g., UDP + WebTransport)
+    /// where each transport has its own Server entity. Unlike [`to_clients`](Self::to_clients),
+    /// which requires exactly one Server entity in the world, this method explicitly
+    /// specifies which server's clients to replicate to.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // When a client connects via a specific server transport
+    /// fn handle_connected(
+    ///     trigger: On<Add, Connected>,
+    ///     query: Query<&LinkOf>,
+    ///     mut commands: Commands,
+    /// ) {
+    ///     let link_of = query.get(trigger.entity).unwrap();
+    ///     let server_entity = link_of.server;
+    ///     
+    ///     commands.spawn((
+    ///         Player,
+    ///         Replicate::to_clients_via(server_entity, NetworkTarget::All),
+    ///     ));
+    /// }
+    /// ```
+    #[cfg(feature = "server")]
+    pub fn to_clients_via(server: Entity, target: NetworkTarget) -> Self {
+        Self {
+            mode: ReplicationMode::Server(server, target),
+        }
+    }
+
+    /// Replicate to all clients matching the target, regardless of which server they're connected to.
+    /// 
+    /// This is the recommended mode for multi-transport setups where you want a unified game world
+    /// visible to all clients across all transports (e.g., UDP + WebTransport).
+    /// 
+    /// Unlike [`to_clients`](Self::to_clients) which requires a single Server entity,
+    /// and [`to_clients_via`](Self::to_clients_via) which replicates to one server's clients,
+    /// this mode replicates to ALL matching clients regardless of their transport.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // Spawn a player visible to all clients on all transports
+    /// commands.spawn((
+    ///     Player,
+    ///     Replicate::to_all(NetworkTarget::All),
+    /// ));
+    /// ```
+    #[cfg(feature = "server")]
+    pub fn to_all(target: NetworkTarget) -> Self {
+        Self {
+            mode: ReplicationMode::Target(target),
+        }
+    }
+
     pub fn manual(senders: Vec<Entity>) -> Self {
         Self {
             mode: ReplicationMode::Manual(senders),
@@ -965,10 +1020,23 @@ impl Replicate {
                         },
                     );
                 }
-                ReplicationMode::Target(_) => {
-                    todo!(
-                        "need a global mapping from remote_peer to corresponding replication_sender"
-                    )
+                ReplicationMode::Target(target) => {
+                    // Target mode: replicate to all matching ReplicationSender entities regardless of which server they're connected to.
+                    // This is useful for multi-transport setups where you want a unified world across all transports.
+                    use lightyear_connection::client_of::ClientOf;
+                    use lightyear_connection::host::HostClient;
+                    let peer_metadata = world.resource::<PeerMetadata>();
+                    
+                    // Query all clients with ReplicationSender
+                    for (client_entity, remote_id, host_client) in world
+                        .query_filtered::<(Entity, &RemoteId, Has<HostClient>), (With<ClientOf>, Or<(With<ReplicationSender>, With<HostClient>)>)>()
+                        .iter(world)
+                    {
+                        // Check if this client matches the target
+                        if target.targets(&remote_id) {
+                            add_sender(&mut state.per_sender_state, client_entity, host_client);
+                        }
+                    }
                 }
                 ReplicationMode::Manual(sender_entities) => {
                     for entity in sender_entities.iter() {
