@@ -6,5 +6,10 @@ publish = false
 
 [dependencies]
 bevy = { workspace = true }
-lightyear_connection = { path = "../../lightyear_connection", features = ["server"] }
-lightyear_link = { path = "../../lightyear_link" }
+lightyear = { path = "../../lightyear", features = ["server", "client", "udp", "webtransport", "netcode"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[[bin]]
+name = "server_role_example"
+path = "src/main.rs"
