@@ -29,6 +29,9 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(feature = "server")]
+pub mod server_role;
+
 pub mod direction;
 pub mod network_target;
 
@@ -80,6 +83,10 @@ pub mod prelude {
         pub use crate::server::{
             ConnectionError, Start, Started, Starting, Stop, Stopped, is_headless_server,
         };
+        pub use crate::server_role::{
+            has_server_role, is_server_running, IoServer, ServerRole, ServerRolePlugin,
+            ServerRoleState,
+        };
     }
 }
 
@@ -88,5 +95,10 @@ pub mod prelude {
 pub struct ConnectionPlugin;
 
 impl Plugin for ConnectionPlugin {
-    fn build(&self, _: &mut App) {}
+    fn build(&self, app: &mut App) {
+        #[cfg(feature = "server")]
+        {
+            app.add_plugins(server_role::ServerRolePlugin);
+        }
+    }
 }
