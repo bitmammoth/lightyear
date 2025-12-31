@@ -1,0 +1,10 @@
+[package]
+name = "server_role_example"
+version = "0.25.5"
+edition = "2021"
+publish = false
+
+[dependencies]
+bevy = { workspace = true }
+lightyear_connection = { path = "../../lightyear_connection", features = ["server"] }
+lightyear_link = { path = "../../lightyear_link" }
