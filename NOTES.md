@@ -1,3 +1,33 @@
+### Multi-Transport Input System Fix (CRITICAL)
+
+**Problem:** In multi-transport setups, `update_action_state` in `lightyear_inputs/src/server.rs` was NOT running because the `Single<..., With<Started>>` query was failing.
+
+**Root Cause:** Four entities have `Started` component:
+1. UdpTransport
+2. GameServer (the logical Server entity)
+3. WebSocketTransport
+4. WebTransportTransport
+
+The `Single` query expects exactly ONE matching entity, so it silently failed with 4 matches.
+
+**Fix:** Changed the query from `With<Started>` to `With<Server>`:
+```rust
+// Before (broken for multi-transport):
+server: Single<(Entity, Has<HostServer>), With<Started>>,
+
+// After (works for multi-transport):
+server: Single<(Entity, Has<HostServer>), With<Server>>,
+```
+
+The `Server` component is unique to the logical GameServer entity. Added import:
+```rust
+use lightyear_link::prelude::{LinkOf, Server};
+```
+
+**Location:** `lightyear_inputs/src/server.rs` line ~291
+
+---
+
 ### PartialPrediction Snapshots
 
 - we want to treat the 'default replication group' differently: instead of each entity being its own replication group, 

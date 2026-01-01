@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use lightyear::connection::client::{Connected, Disconnected, Connecting};
 use lightyear::netcode::Key;
 use lightyear::prelude::client::*;
+use lightyear::prelude::client::input::*;
+use lightyear::prelude::input::native::*;
 use lightyear::prelude::*;
+use lightyear::input::input_buffer::InputBuffer;
 use lightyear::websocket::prelude::client::ClientConfig as WebSocketClientConfig;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -35,11 +38,22 @@ impl Plugin for ExampleClientPlugin {
         app.add_observer(on_connecting);
         app.add_observer(on_connected);
         app.add_observer(on_disconnected);
+        // Input buffering must be in WriteClientInputs set
+        app.add_systems(
+            FixedPreUpdate,
+            buffer_input.in_set(InputSystems::WriteClientInputs),
+        );
+        // Movement in FixedUpdate for determinism (on predicted entities)
+        app.add_systems(FixedUpdate, player_movement);
+        // Predicted/Interpolated spawn handlers
+        app.add_observer(handle_predicted_spawn);
+        app.add_observer(handle_interpolated_spawn);
         app.add_systems(Update, (
             display_new_players,
             count_replicated_entities,
             auto_send_messages,
             receive_server_messages,
+            debug_input_sync_status,
         ));
     }
 }
@@ -167,23 +181,24 @@ fn startup(mut commands: Commands, config: Res<ClientConfig>) -> Result {
 
 /// Display information about newly replicated player entities
 fn display_new_players(
-    players: Query<(&Player, &PlayerPosition, &PlayerColor, &Name), Added<Player>>,
+    players: Query<(Entity, &PlayerId, &PlayerPosition, &PlayerColor, &Name, Has<Predicted>, Has<Interpolated>), Added<PlayerId>>,
 ) {
-    for (player, pos, color, name) in players.iter() {
+    for (entity, player_id, pos, color, name, is_predicted, is_interpolated) in players.iter() {
         let color_rgb = match color.0 {
             Color::Srgba(c) => format!("({:.1}, {:.1}, {:.1})", c.red, c.green, c.blue),
             _ => "unknown".to_string(),
         };
+        let entity_type = if is_predicted { "Predicted" } else if is_interpolated { "Interpolated" } else { "Regular" };
         info!(
-            "🎮 Replicated player spawned: {} (ID: {:?}) at ({:.1}, {:.1}) color: {}",
-            name, player.id, pos.0.x, pos.0.y, color_rgb
+            "🎮 {} player spawned: {} entity {:?} (ID: {:?}) at ({:.1}, {:.1}) color: {}",
+            entity_type, name, entity, player_id.0, pos.0.x, pos.0.y, color_rgb
         );
     }
 }
 
 /// Log the count of replicated entities when it changes
 fn count_replicated_entities(
-    players: Query<Entity, With<Player>>,
+    players: Query<Entity, With<PlayerId>>,
     mut last_count: Local<usize>,
 ) {
     let count = players.iter().count();
@@ -200,14 +215,14 @@ fn auto_send_messages(
     config: Res<ClientConfig>,
     mut client_sender_query: Query<&mut MessageSender<ClientToServerMessage>, (With<Client>, With<Connected>)>,
     mut forward_query: Query<&mut MessageSender<ForwardMessage>, (With<Client>, With<Connected>)>,
-    players: Query<&Player>,
+    players: Query<(), With<PlayerId>>,
 ) {
     timer.timer.tick(time.delta());
-    
+
     if !timer.timer.just_finished() {
         return;
     }
-    
+
     // Only test when we have 3 players replicated (all transports connected)
     if players.iter().count() < 3 {
         return;
@@ -293,6 +308,136 @@ fn receive_server_messages(
                     });
                 }
             }
+        }
+    }
+}
+
+/// System that reads from peripherals and adds inputs to the buffer
+/// Must run in InputSystems::WriteClientInputs set in FixedPreUpdate
+fn buffer_input(
+    mut query: Query<(Entity, &mut ActionState<Inputs>), With<InputMarker<Inputs>>>,
+    keypress: Res<ButtonInput<KeyCode>>,
+    mut logged: Local<bool>,
+) {
+    // Log once when we find entities
+    if !*logged {
+        let count = query.iter().count();
+        if count > 0 {
+            info!("🔍 Client buffer_input found {} entities with InputMarker + ActionState", count);
+            *logged = true;
+        }
+    }
+
+    for (entity, mut action_state) in query.iter_mut() {
+        let mut direction = Direction {
+            up: false,
+            down: false,
+            left: false,
+            right: false,
+        };
+        if keypress.pressed(KeyCode::KeyW) || keypress.pressed(KeyCode::ArrowUp) {
+            direction.up = true;
+        }
+        if keypress.pressed(KeyCode::KeyS) || keypress.pressed(KeyCode::ArrowDown) {
+            direction.down = true;
+        }
+        if keypress.pressed(KeyCode::KeyA) || keypress.pressed(KeyCode::ArrowLeft) {
+            direction.left = true;
+        }
+        if keypress.pressed(KeyCode::KeyD) || keypress.pressed(KeyCode::ArrowRight) {
+            direction.right = true;
+        }
+        // Always set the value - None means missing input, not "no keys pressed"
+        action_state.0 = Inputs::Direction(direction.clone());
+        if !direction.is_none() {
+            info!("📝 Client buffering input for entity {:?}: {:?}", entity, direction);
+        }
+    }
+}
+
+/// Apply movement to predicted entities we own
+fn player_movement(
+    mut position_query: Query<(&mut PlayerPosition, &ActionState<Inputs>), With<Predicted>>,
+) {
+    for (position, input) in position_query.iter_mut() {
+        // Note: pass Mut<PlayerPosition> directly, getting &mut triggers change detection
+        shared_movement_behaviour(position, input);
+    }
+}
+
+/// When predicted copy of client-owned entity spawns:
+/// - Change saturation to differentiate predicted from server
+/// - Add InputMarker (ActionState and InputBuffer are added automatically via required components)
+///
+/// Note: We don't need to check for `Controlled` because only OUR player is Predicted
+/// (other players are Interpolated via InterpolationTarget). This matches simple_box pattern.
+fn handle_predicted_spawn(
+    trigger: On<Add, PlayerId>,
+    mut predicted: Query<&mut PlayerColor, With<Predicted>>,
+    mut commands: Commands,
+) {
+    let entity = trigger.entity;
+    if let Ok(mut color) = predicted.get_mut(entity) {
+        let hsva = Hsva {
+            saturation: 0.4,
+            ..Hsva::from(color.0)
+        };
+        color.0 = Color::from(hsva);
+        info!("🎮 Predicted entity spawned: {:?}, adding InputMarker", entity);
+        commands.entity(entity).insert(InputMarker::<Inputs>::default());
+    }
+}
+
+/// When interpolated copy of other players' entities spawns:
+/// - Change saturation to differentiate interpolated from server
+fn handle_interpolated_spawn(
+    trigger: On<Add, PlayerColor>,
+    mut interpolated: Query<&mut PlayerColor, With<Interpolated>>,
+) {
+    if let Ok(mut color) = interpolated.get_mut(trigger.entity) {
+        let hsva = Hsva {
+            saturation: 0.1,
+            ..Hsva::from(color.0)
+        };
+        color.0 = Color::from(hsva);
+        info!("👤 Interpolated entity spawned: {:?}", trigger.entity);
+    }
+}
+
+/// Debug system to monitor input sync status
+fn debug_input_sync_status(
+    client_query: Query<(
+        Entity,
+        Has<InputTimeline>,
+        Has<IsSynced<InputTimeline>>,
+        Has<Connected>,
+    ), With<Client>>,
+    input_entities: Query<(
+        Entity,
+        Has<InputMarker<Inputs>>,
+        Has<ActionState<Inputs>>,
+        Option<&InputBuffer<ActionState<Inputs>, Inputs>>,
+    ), With<Predicted>>,
+    mut timer: Local<Option<Timer>>,
+    time: Res<Time>,
+) {
+    let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
+    timer.tick(time.delta());
+
+    if timer.just_finished() {
+        for (entity, has_input_timeline, has_is_synced, has_connected) in client_query.iter() {
+            info!(
+                "🔄 Client {:?} - InputTimeline: {}, IsSynced: {}, Connected: {}",
+                entity, has_input_timeline, has_is_synced, has_connected
+            );
+        }
+
+        for (entity, has_marker, has_state, input_buffer) in input_entities.iter() {
+            let buffer_info = input_buffer.map(|b| format!("start={:?}, len={}", b.start_tick, b.len())).unwrap_or("None".to_string());
+            info!(
+                "🎮 Predicted {:?} - InputMarker: {}, ActionState: {}, InputBuffer: {}",
+                entity, has_marker, has_state, buffer_info
+            );
         }
     }
 }

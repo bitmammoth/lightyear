@@ -24,7 +24,6 @@ use core::fmt::{Debug, Formatter};
 use lightyear_connection::client::Connected;
 use lightyear_connection::host::HostServer;
 use lightyear_connection::prelude::NetworkTarget;
-use lightyear_connection::server::Started;
 use lightyear_core::id::RemoteId;
 use lightyear_core::prelude::LocalTimeline;
 use lightyear_core::tick::TickDuration;
@@ -288,7 +287,9 @@ fn update_action_state<S: ActionStateSequence>(
     //  and use the timeline from that connection? i.e. find from which entity we got the first InputMessage?
     //  presumably the entity is replicated to many clients, but only one client is controlling the entity?
     timeline: Res<LocalTimeline>,
-    server: Single<(Entity, Has<HostServer>), With<Started>>,
+    // Use `With<Server>` instead of `With<Started>` to correctly identify the logical Server entity.
+    // In multi-transport setups, multiple entities (transports) have `Started`, but only one has `Server`.
+    server: Single<(Entity, Has<HostServer>), With<Server>>,
     mut action_state_query: Query<(
         Entity,
         StateMut<S>,

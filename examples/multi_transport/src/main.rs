@@ -22,8 +22,10 @@
 use bevy::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 use core::time::Duration;
+use lightyear::prelude::DebugUIPlugin;
 
 mod client;
+mod renderer;
 mod server;
 mod shared;
 
@@ -80,6 +82,8 @@ fn run_server() {
         })
         .add_plugins(SharedPlugin)
         .add_plugins(server::ExampleServerPlugin)
+        .add_plugins(renderer::ExampleRendererPlugin)
+        .add_plugins(DebugUIPlugin)
         .run();
 }
 
@@ -112,5 +116,7 @@ fn run_client(transport: TransportArg, cert: Option<String>) {
         })
         .add_plugins(SharedPlugin)
         .add_plugins(client::ExampleClientPlugin)
+        .add_plugins(renderer::ExampleRendererPlugin)
+        .add_plugins(DebugUIPlugin)
         .run();
 }

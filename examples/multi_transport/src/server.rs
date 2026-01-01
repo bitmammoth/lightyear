@@ -24,7 +24,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
+use lightyear::prelude::input::native::ActionState;
+use lightyear::input::input_buffer::InputBuffer;
 use lightyear::link::prelude::ViaTransport;
+use lightyear::connection::server::Started;
 
 pub struct ExampleServerPlugin;
 
@@ -36,11 +39,15 @@ impl Plugin for ExampleServerPlugin {
         app.add_observer(handle_new_client);
         app.add_observer(handle_connected);
         app.add_observer(handle_client_disconnected);
+        // Movement in FixedUpdate for determinism
+        app.add_systems(FixedUpdate, movement);
         app.add_systems(Update, (
             log_server_role,
             log_connected_clients,
             auto_send_messages,
             receive_client_messages,
+            debug_action_states,
+            debug_input_messages,
         ));
     }
 }
@@ -102,11 +109,14 @@ fn handle_connected(
     mut registry: ResMut<PlayerRegistry>,
 ) {
     let Ok((remote_id, link_of, via_transport)) = client_query.get(trigger.entity) else {
+        warn!("⚠️ Connected trigger but couldn't get client components for {:?}", trigger.entity);
         return;
     };
     let client_id = remote_id.0;
     let server_entity = link_of.server;
     let player_id = registry.next_player_id();
+
+    info!("📋 Server connecting client {:?} (RemoteId: {:?})", trigger.entity, client_id);
     
     // Determine player name from transport (UDP, WT, WS)
     let player_name = transport_names.get(via_transport.transport)
@@ -130,9 +140,11 @@ fn handle_connected(
     };
     
     // Spawn the player entity with replication to ALL clients
+    // Also add PredictionTarget (owner predicts), InterpolationTarget (others interpolate), and ControlledBy
+    // NOTE: Don't add ActionState here - it will be added automatically when the first input message is received
     let player_entity = commands
         .spawn((
-            Player { id: player_id },
+            player_id,  // Flat PlayerId - matches simple_box pattern
             PlayerPosition(Vec2::new(
                 match player_name.as_str() {
                     "UDP" => -100.0,
@@ -143,14 +155,24 @@ fn handle_connected(
                 0.0,
             )),
             PlayerColor(color),
+            // Replicate to all clients across all transports
             Replicate::to_all(NetworkTarget::All),
+            // The owning client will predict this entity
+            PredictionTarget::to_all(NetworkTarget::Single(client_id)),
+            // Other clients will interpolate this entity
+            InterpolationTarget::to_all(NetworkTarget::AllExceptSingle(client_id)),
+            // Track which client controls this entity (for input processing)
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
+            },
             Name::new(player_name.clone()),
         ))
         .id();
-    
+
     registry.client_to_player.insert(trigger.entity, (player_name.clone(), player_entity));
     registry.name_to_client.insert(player_name.clone(), trigger.entity);
-    info!("   Spawned player '{}' entity {:?}", player_name, player_entity);
+    info!("   ✅ Spawned player '{}' entity {:?}", player_name, player_entity);
 }
 
 /// Handle client disconnections
@@ -240,6 +262,13 @@ fn startup(mut commands: Commands) -> Result {
         .id();
     commands.trigger(Start { entity: ws_transport });
     info!("🔌 WebSocket transport starting on port {} -> Server {:?}", WEBSOCKET_PORT, server);
+
+    // 5. Manually add Started to the Server entity
+    // In single-transport setups, Start trigger adds Started automatically because Server has NetcodeServer.
+    // In multi-transport, the Server entity doesn't have NetcodeServer (only transports do),
+    // so we need to add Started manually to enable input processing.
+    commands.entity(server).insert(Started);
+    info!("🚀 Server entity {:?} marked as Started", server);
 
     info!("\n✅ Server initialized with 3 transports. All clients connect to Server {:?}\n", server);
     Ok(())
@@ -363,6 +392,105 @@ fn receive_client_messages(
                 }
             } else {
                 info!("   ⚠️ Target '{}' not found", target_name);
+            }
+        }
+    }
+}
+
+/// Read client inputs and move players on server
+/// This gives a basis for other clients to interpolate
+/// NOTE: ActionState is added to the entity when the first input message is received
+fn movement(
+    timeline: Res<LocalTimeline>,
+    mut position_query: Query<
+        (Entity, &mut PlayerPosition, Option<&ActionState<Inputs>>, &Name),
+        // In host-server mode, don't apply to local client's entities
+        // because they are already moved by the client plugin
+        Without<Predicted>,
+    >,
+    mut logged: Local<bool>,
+) {
+    let tick = timeline.tick();
+
+    // Log once to show we're checking for entities
+    if !*logged && position_query.iter().count() > 0 {
+        info!("🔍 Server movement system found {} player entities", position_query.iter().count());
+        *logged = true;
+    }
+
+    for (entity, position, inputs, name) in position_query.iter_mut() {
+        // ActionState is only present after the first input message is received
+        if let Some(inputs) = inputs {
+            if let Inputs::Direction(ref dir) = &inputs.0 {
+                if !dir.is_none() {
+                    info!("🎮 Server processing input for {} (entity {:?}) at tick {:?}: {:?}",
+                        name, entity, tick, dir);
+                }
+            }
+            shared_movement_behaviour(position, inputs);
+        }
+    }
+}
+
+/// Debug system to check if ActionState is being updated by the InputPlugin
+fn debug_action_states(
+    query: Query<(Entity, Option<&ActionState<Inputs>>, &Name), With<PlayerId>>,
+    mut timer: Local<Option<Timer>>,
+    time: Res<Time>,
+) {
+    let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
+    timer.tick(time.delta());
+
+    if timer.just_finished() {
+        for (entity, action_state, name) in query.iter() {
+            match action_state {
+                Some(state) => info!("📊 Server ActionState for {} ({:?}): {:?}", name, entity, state.0),
+                None => info!("📊 Server ActionState for {} ({:?}): <not yet received>", name, entity),
+            }
+        }
+    }
+}
+
+/// Debug system to check for incoming input messages and input buffers
+fn debug_input_messages(
+    // Check for InputBuffer on player entities
+    player_buffers: Query<(Entity, Option<&InputBuffer<ActionState<Inputs>, Inputs>>, Option<&ActionState<Inputs>>, &Name), With<PlayerId>>,
+    // Check for client links
+    client_links: Query<(Entity, &Name), With<ClientOf>>,
+    // Check for servers with Started
+    servers: Query<(Entity, Has<Started>, &Name), With<Server>>,
+    timeline: Res<LocalTimeline>,
+    mut timer: Local<Option<Timer>>,
+    time: Res<Time>,
+) {
+    let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
+    timer.tick(time.delta());
+
+    if timer.just_finished() {
+        let tick = timeline.tick();
+        
+        // Check servers
+        for (entity, has_started, name) in servers.iter() {
+            info!("🖥️ Server {} ({:?}): Started={}, current_tick={:?}", name, entity, has_started, tick);
+        }
+        
+        // Check for active client links
+        for (entity, name) in client_links.iter() {
+            info!("🔗 Server has client link: {} ({:?})", name, entity);
+        }
+
+        // Check input buffers on player entities
+        for (entity, buffer, action_state, name) in player_buffers.iter() {
+            match buffer {
+                Some(b) => {
+                    info!("📦 InputBuffer for {} ({:?}): start={:?}, len={}, tick={:?}",
+                        name, entity, b.start_tick, b.len(), tick);
+                },
+                None => {}
+            }
+            match action_state {
+                Some(s) => info!("✅ ActionState for {} ({:?}): {:?}", name, entity, s),
+                None => {}
             }
         }
     }
