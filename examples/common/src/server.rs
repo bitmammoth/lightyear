@@ -98,7 +98,11 @@ impl ExampleServer {
         world.commands().queue(move |world: &mut World| -> Result {
             let mut entity_mut = world.entity_mut(entity);
             let settings = entity_mut.take::<ExampleServer>().unwrap();
-            entity_mut.insert((Name::from("Server"),));
+            // Add Server component explicitly - this is the marker component that
+            // identifies this entity as the server. Previously this was auto-added
+            // via #[require(Server)] on NetcodeServer, but that was removed to support
+            // multi-transport configurations where transport entities shouldn't have Server.
+            entity_mut.insert((Name::from("Server"), Server::default()));
 
             let add_netcode = |entity_mut: &mut EntityWorldMut| {
                 // Use private key from environment variable, if set. Otherwise from settings file.

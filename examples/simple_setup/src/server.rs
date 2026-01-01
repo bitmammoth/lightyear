@@ -41,6 +41,9 @@ fn handle_new_client(trigger: On<Add, Connected>, mut commands: Commands) {
 fn startup(mut commands: Commands) -> Result {
     let server = commands
         .spawn((
+            // Server component is the marker for the server entity.
+            // It must be added explicitly since NetcodeServer no longer auto-requires it.
+            Server::default(),
             NetcodeServer::new(server::NetcodeConfig::default()),
             LocalAddr(SERVER_ADDR),
             ServerUdpIo::default(),

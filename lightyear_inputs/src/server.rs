@@ -17,13 +17,14 @@ use bevy_ecs::{
     query::With,
     resource::Resource,
     schedule::{IntoScheduleConfigs, SystemSet},
-    system::{Commands, Query, Res, Single},
+    system::{Commands, Query, Res},
 };
 use bevy_utils::prelude::DebugName;
 use core::fmt::{Debug, Formatter};
 use lightyear_connection::client::Connected;
 use lightyear_connection::host::HostServer;
 use lightyear_connection::prelude::NetworkTarget;
+use lightyear_connection::server::Started;
 use lightyear_core::id::RemoteId;
 use lightyear_core::prelude::LocalTimeline;
 use lightyear_core::tick::TickDuration;
@@ -287,16 +288,21 @@ fn update_action_state<S: ActionStateSequence>(
     //  and use the timeline from that connection? i.e. find from which entity we got the first InputMessage?
     //  presumably the entity is replicated to many clients, but only one client is controlling the entity?
     timeline: Res<LocalTimeline>,
-    // Use `With<Server>` instead of `With<Started>` to correctly identify the logical Server entity.
-    // In multi-transport setups, multiple entities (transports) have `Started`, but only one has `Server`.
-    server: Single<(Entity, Has<HostServer>), With<Server>>,
+    // Query for Server entities that are Started.
+    // In single-transport mode: One entity has both Server (from NetcodeServer require) and Started
+    // In multi-transport mode: The explicit Server entity has Server + Started (manually added)
+    // We use Query instead of Single to gracefully handle cases where no server exists yet
+    server_query: Query<(Entity, Has<HostServer>), (With<Server>, With<Started>)>,
     mut action_state_query: Query<(
         Entity,
         StateMut<S>,
         &mut InputBuffer<S::Snapshot, S::Action>,
     )>,
 ) {
-    let (server, host_client) = server.into_inner();
+    // Get the first server entity (there should only be one with both Server and Started)
+    let Some((server, host_client)) = server_query.iter().next() else {
+        return; // No server ready yet
+    };
     let tick = timeline.tick();
     for (entity, action_state, mut input_buffer) in action_state_query.iter_mut() {
         trace!(?tick, ?server, ?input_buffer, "input buffer on server");

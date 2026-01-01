@@ -134,97 +134,101 @@ impl ServerUdpPlugin {
 
     fn receive(
         commands: ParallelCommands,
-        mut transport_query: Query<(Entity, &mut ServerUdpIo, &TransportOf), With<Linked>>,
+        // Multi-transport mode: ServerUdpIo has TransportOf
+        mut multi_transport_query: Query<(Entity, &mut ServerUdpIo, &TransportOf), With<Linked>>,
+        // Single-transport mode: ServerUdpIo without TransportOf (server on same entity)
+        mut single_transport_query: Query<(Entity, &mut ServerUdpIo), (With<Linked>, Without<TransportOf>)>,
         // TODO: we want to have With<Linked> here, but that would mean that if a client sends 2 packets in a row
         //  for the first one we spawn them, and for the second one the query will return False.
         //  maybe have a separate Vec for new addresses, and for these we don't require Linked?
         link_query: Query<Option<&mut Link>>,
     ) {
-        transport_query
-            // TODO: would par_iter_mut be better here?
-            .iter_mut()
-            .for_each(|(transport_entity, mut server_udp_io, transport_of)| {
-                // Get the Server entity that LinkOfs should point to
-                let server_entity = transport_of.server;
-                
-                // SAFETY: we know that each ServerUdpIo will target different Link entities, so there won't be any aliasing
-                let mut link_query = unsafe { link_query.reborrow_unsafe() };
+        // Helper to process incoming UDP packets
+        fn receive_for_transport(
+            commands: &ParallelCommands,
+            transport_entity: Entity,
+            server_entity: Entity,
+            server_udp_io: &mut ServerUdpIo,
+            link_query: &Query<Option<&mut Link>>,
+            is_multi_transport: bool,
+        ) {
+            // SAFETY: we know that each ServerUdpIo will target different Link entities, so there won't be any aliasing
+            let mut link_query = unsafe { link_query.reborrow_unsafe() };
 
-                // enable split borrows
-                let server_udp_io = &mut *server_udp_io;
+            loop {
+                // reserve additional space in the buffer
+                // this tries to reclaim space at the start of the buffer if possible
+                server_udp_io.buffer.reserve(crate::MTU);
+                // Check how much actual uninitialized space we have at the end
+                let capacity = server_udp_io.buffer.capacity();
+                let current_len = server_udp_io.buffer.len();
+                assert_eq!(current_len, 0);
+                let available_uninit = capacity - current_len;
+                let max_recv_len = core::cmp::min(available_uninit, crate::MTU);
 
-                loop {
-                    // reserve additional space in the buffer
-                    // this tries to reclaim space at the start of the buffer if possible
-                    server_udp_io.buffer.reserve(crate::MTU);
-                    // Check how much actual uninitialized space we have at the end
-                    let capacity = server_udp_io.buffer.capacity();
-                    let current_len = server_udp_io.buffer.len();
-                    assert_eq!(current_len, 0);
-                    let available_uninit = capacity - current_len;
-                    let max_recv_len = core::cmp::min(available_uninit, crate::MTU);
-
-                    // We get a raw pointer to the start of the uninitialized region.
-                    // SAFETY: we know we have enough space to receive the data because we just reserved it
-                    let buf_slice: &mut [u8] = unsafe {
-                        let ptr = server_udp_io.buffer.as_mut_ptr().add(current_len);
-                        core::slice::from_raw_parts_mut(ptr, max_recv_len)
-                    };
-                    match server_udp_io.socket.as_mut().unwrap().recv_from(buf_slice) {
-                        Ok((recv_len, address)) => {
-                            // Mark the received bytes as initialized
-                            // SAFETY: we know that the buffer is large enough to hold the received data.
-                            unsafe {
-                                server_udp_io.buffer.advance_mut(recv_len);
-                            }
-                            let payload = server_udp_io.buffer.split_to(recv_len).freeze();
-                            match server_udp_io.connected_addresses.entry(address) {
-                                Entry::Occupied(mut entry) => {
-                                    match *entry.get_mut() {
-                                        LinkOfStatus::Spawning(_) => {
-                                            // we are still spawning the entity, so we will drop this packet
-                                            // and wait for the next one
-                                            continue;
-                                        }
-                                        LinkOfStatus::Spawned(entity) => {
-                                            match link_query.get_mut(entity) {
-                                                Ok(mut link) => {
-                                                    match link.as_mut() {
-                                                        None => {
-                                                            debug!("despawning entity {} because it has no udp link", entity);
-                                                            // the entity exists but has not link.
-                                                            // this is a weird state, let's despawn it
-                                                            entry.remove();
-                                                            commands.command_scope(|mut c| {
-                                                                if let Ok(mut e) = c.get_entity(entity) {
-                                                                    e.try_despawn();
-                                                                }
-                                                            });
-                                                        }
-                                                        Some(link) => {
-                                                            link.recv.push(payload, Instant::now());
-                                                        }
+                // We get a raw pointer to the start of the uninitialized region.
+                // SAFETY: we know we have enough space to receive the data because we just reserved it
+                let buf_slice: &mut [u8] = unsafe {
+                    let ptr = server_udp_io.buffer.as_mut_ptr().add(current_len);
+                    core::slice::from_raw_parts_mut(ptr, max_recv_len)
+                };
+                match server_udp_io.socket.as_mut().unwrap().recv_from(buf_slice) {
+                    Ok((recv_len, address)) => {
+                        // Mark the received bytes as initialized
+                        // SAFETY: we know that the buffer is large enough to hold the received data.
+                        unsafe {
+                            server_udp_io.buffer.advance_mut(recv_len);
+                        }
+                        let payload = server_udp_io.buffer.split_to(recv_len).freeze();
+                        match server_udp_io.connected_addresses.entry(address) {
+                            Entry::Occupied(mut entry) => {
+                                match *entry.get_mut() {
+                                    LinkOfStatus::Spawning(_) => {
+                                        // we are still spawning the entity, so we will drop this packet
+                                        // and wait for the next one
+                                        continue;
+                                    }
+                                    LinkOfStatus::Spawned(entity) => {
+                                        match link_query.get_mut(entity) {
+                                            Ok(mut link) => {
+                                                match link.as_mut() {
+                                                    None => {
+                                                        debug!("despawning entity {} because it has no udp link", entity);
+                                                        // the entity exists but has not link.
+                                                        // this is a weird state, let's despawn it
+                                                        entry.remove();
+                                                        commands.command_scope(|mut c| {
+                                                            if let Ok(mut e) = c.get_entity(entity) {
+                                                                e.try_despawn();
+                                                            }
+                                                        });
+                                                    }
+                                                    Some(link) => {
+                                                        link.recv.push(payload, Instant::now());
                                                     }
                                                 }
-                                                Err(_) => {
-                                                    error!(
-                                                        "Received UDP packet for unknown entity: {}",
-                                                        entity
-                                                    );
-                                                    // this might because the remote entity has disconnected and is trying to reconnect.
-                                                    // Remove the entry so that the next packet can be processed
-                                                    entry.remove();
-                                                    continue;
-                                                }
+                                            }
+                                            Err(_) => {
+                                                error!(
+                                                    "Received UDP packet for unknown entity: {}",
+                                                    entity
+                                                );
+                                                // this might because the remote entity has disconnected and is trying to reconnect.
+                                                // Remove the entry so that the next packet can be processed
+                                                entry.remove();
+                                                continue;
                                             }
                                         }
                                     }
                                 }
-                                Entry::Vacant(vacant) => {
-                                    // we are spawning a new entity but the initial packets will be dropped
-                                    let mut link = Link::new(None);
-                                    link.recv.push(payload, Instant::now());
-                                    commands.command_scope(|mut c| {
+                            }
+                            Entry::Vacant(vacant) => {
+                                // we are spawning a new entity but the initial packets will be dropped
+                                let mut link = Link::new(None);
+                                link.recv.push(payload, Instant::now());
+                                commands.command_scope(|mut c| {
+                                    if is_multi_transport {
+                                        // Multi-transport mode: add ViaTransport to client
                                         let entity = c
                                             .spawn((
                                                 LinkOf {
@@ -237,30 +241,75 @@ impl ServerUdpPlugin {
                                                 Linked,
                                                 PeerAddr(address),
                                                 UdpLinkOfIO,
-                                                // TODO: should we add LocalAddr?
                                             ))
                                             .id();
-                                        info!(?entity, ?server_entity, ?transport_entity, "Received UDP packet from new address {address}, Spawn new LinkOf");
+                                        info!(?entity, ?server_entity, ?transport_entity, "Received UDP packet from new address {address}, Spawn new LinkOf (multi-transport)");
                                         vacant.insert(LinkOfStatus::Spawning(entity));
-                                    });
-                                    continue;
-                                }
-                            };
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            error!("Error receiving UDP packet: {}", e);
-                            break;
-                        }
+                                    } else {
+                                        // Single-transport mode: no ViaTransport needed
+                                        let entity = c
+                                            .spawn((
+                                                LinkOf {
+                                                    server: server_entity,
+                                                },
+                                                link,
+                                                Linked,
+                                                PeerAddr(address),
+                                                UdpLinkOfIO,
+                                            ))
+                                            .id();
+                                        info!(?entity, ?server_entity, "Received UDP packet from new address {address}, Spawn new LinkOf (single-transport)");
+                                        vacant.insert(LinkOfStatus::Spawning(entity));
+                                    }
+                                });
+                                continue;
+                            }
+                        };
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        error!("Error receiving UDP packet: {}", e);
+                        break;
                     }
                 }
+            }
 
-                // set every spawning to spawned
-                server_udp_io.connected_addresses.iter_mut().for_each(|(addr, status)| {
-                    if let LinkOfStatus::Spawning(entity) = status {
-                        *status = LinkOfStatus::Spawned(*entity);
-                    }
-                });
+            // set every spawning to spawned
+            server_udp_io.connected_addresses.iter_mut().for_each(|(_addr, status)| {
+                if let LinkOfStatus::Spawning(entity) = status {
+                    *status = LinkOfStatus::Spawned(*entity);
+                }
+            });
+        }
+
+        // Multi-transport mode
+        multi_transport_query
+            .iter_mut()
+            .for_each(|(transport_entity, mut server_udp_io, transport_of)| {
+                let server_entity = transport_of.server;
+                receive_for_transport(
+                    &commands,
+                    transport_entity,
+                    server_entity,
+                    &mut server_udp_io,
+                    &link_query,
+                    true,
+                );
+            });
+
+        // Single-transport mode (server entity is the same as transport entity)
+        single_transport_query
+            .iter_mut()
+            .for_each(|(entity, mut server_udp_io)| {
+                // In single-transport mode, the server entity is the same as this entity
+                receive_for_transport(
+                    &commands,
+                    entity,
+                    entity,
+                    &mut server_udp_io,
+                    &link_query,
+                    false,
+                );
             });
     }
 }
