@@ -1,7 +1,7 @@
 [package]
 name = "simple_box_multi_transport"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [[bin]]
@@ -9,27 +9,38 @@ name = "simple_box_multi"
 path = "src/main.rs"
 
 [dependencies]
-bevy = { workspace = true, features = [
-    "bevy_asset",
+bevy = { version = "0.17.3", default-features = false, features = [
+    "bevy_state",
+    "bevy_winit",
     "bevy_render",
     "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
     "bevy_gizmos",
+    "bevy_log",
+    "bevy_picking",
     "default_font",
     "x11",
-    "bevy_winit",
-    "bevy_sprite",
-    "bevy_window",
 ] }
+bevy-inspector-egui = "0.35"
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+
+# Lightyear crates with required features
 lightyear = { path = "../../lightyear", features = [
-    "server", 
-    "client", 
-    "udp", 
-    "webtransport", 
+    "client",
+    "server",
     "netcode",
-    "interpolation",
+    "udp",
+    "webtransport",
     "prediction",
+    "interpolation",
     "replication",
     "input_native",
 ] }
-clap = { version = "4.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
+
+[features]
+default = ["server", "client"]
+server = []
+client = []

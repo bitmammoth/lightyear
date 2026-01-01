@@ -81,7 +81,7 @@ pub mod prelude {
     pub mod server {
         pub use crate::client_of::ClientOf;
         pub use crate::server::{
-            ConnectionError, Start, Started, Starting, Stop, Stopped, is_headless_server,
+            ConnectionError, Start, Started, Starting, Stop, Stopped, is_headless_server, is_server,
         };
         pub use crate::server_role::{
             has_server_role, is_server_running, IoServer, ServerRole, ServerRolePlugin,

@@ -1,17 +1,18 @@
 use crate::client::Client;
 use crate::host::HostClient;
+use crate::server_role::ServerRole;
+use bevy_ecs::prelude::Res;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::system::Query;
-use lightyear_link::server::Server;
 
 /// Returns true if the peer is a client (host-server counts as a server)
 pub fn is_client(query: Query<(), (With<Client>, Without<HostClient>)>) -> bool {
     !query.is_empty()
 }
 
-/// Returns true if the peer is a server
-pub fn is_server(query: Query<(), With<Server>>) -> bool {
-    !query.is_empty()
+/// Returns true if the peer is a server (uses ServerRole for multi-transport support)
+pub fn is_server(server_role: Option<Res<ServerRole>>) -> bool {
+    server_role.is_some_and(|r| r.is_running())
 }
 
 /// Returns true if we are running in host-server mode, i.e. the server is acting as a client

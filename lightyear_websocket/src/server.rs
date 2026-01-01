@@ -8,10 +8,10 @@ use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
 use lightyear_aeronet::server::ServerAeronetPlugin;
 use lightyear_aeronet::{AeronetLinkOf, AeronetPlugin};
-use lightyear_link::prelude::LinkOf;
-use lightyear_link::server::Server;
+use lightyear_connection::prelude::server::IoServer;
+use lightyear_link::prelude::{LinkOf, TransportOf};
 use lightyear_link::{Link, LinkStart, Linked, Linking};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Allows using [`WebSocketServer`].
 pub struct WebSocketServerPlugin;
@@ -31,15 +31,19 @@ impl Plugin for WebSocketServerPlugin {
     }
 }
 
-/// WebSocket server implementation which listens for client connections,
-/// and coordinates messaging between multiple clients.
+/// Marker component to identify this LinkOf as coming from WebSocket
+#[derive(Component)]
+pub struct WebSocketLinkOfIO;
+
+/// WebSocket server IO component.
 ///
-/// Use [`WebSocketServer::open`] to start opening a server.
+/// This is a transport-only component. It does NOT have a `Server` component.
+/// Instead, it should have a `TransportOf { server }` component pointing to
+/// the logical Server entity that all client LinkOfs should connect to.
 ///
 /// The [`LocalAddr`] component must be inserted to specify the server_addr.
-
 #[derive(Component)]
-#[require(Server)]
+#[require(IoServer::websocket())]
 pub struct WebSocketServerIo {
     pub config: ServerConfig,
 }
@@ -69,20 +73,28 @@ impl WebSocketServerPlugin {
     //  because the connecting entity adds SessionEndpoint? (and lightyear_aeronet handles that)
     fn on_connection(
         trigger: On<Add, Session>,
-        query: Query<&AeronetLinkOf>,
+        aeronet_query: Query<&AeronetLinkOf>,
+        transport_query: Query<&TransportOf>,
         child_query: Query<(&ChildOf, &PeerAddr), With<WebSocketServerClient>>,
         mut commands: Commands,
     ) {
         if let Ok((child_of, peer_addr)) = child_query.get(trigger.entity)
-            && let Ok(server_link) = query.get(child_of.parent())
+            && let Ok(aeronet_link) = aeronet_query.get(child_of.parent())
         {
+            // Get the Server entity from TransportOf
+            let server_entity = if let Ok(transport_of) = transport_query.get(aeronet_link.0) {
+                transport_of.server
+            } else {
+                warn!("WebSocketServerIo entity {:?} missing TransportOf component", aeronet_link.0);
+                return;
+            };
+            
             let link_entity = commands
                 .spawn((
-                    LinkOf {
-                        server: server_link.0,
-                    },
+                    LinkOf { server: server_entity },
                     Link::new(None),
                     PeerAddr(peer_addr.0),
+                    WebSocketLinkOfIO,
                 ))
                 .id();
             commands

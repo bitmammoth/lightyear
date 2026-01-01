@@ -12,7 +12,7 @@ use lightyear_connection::host::HostClient;
 use lightyear_connection::prelude::{server::*, *};
 use lightyear_connection::server::Stopping;
 use lightyear_core::id::{LocalId, PeerId, RemoteId};
-use lightyear_link::prelude::{LinkOf, Server};
+use lightyear_link::prelude::{LinkOf, Server, TransportOf, ViaTransport};
 use lightyear_link::{Link, LinkSystems};
 use lightyear_transport::plugin::TransportSystems;
 use tracing::{error, info, trace};
@@ -25,8 +25,12 @@ pub(crate) struct NetcodeServerContext {
     pub(crate) disconnections: Vec<(ClientId, Entity)>,
 }
 
+/// Netcode server component for handling secure client connections.
+/// 
+/// In the new multi-transport architecture, this component should be placed on
+/// transport entities alongside `TransportOf` pointing to the logical Server.
+/// The `#[require(Server)]` was removed to support this pattern.
 #[derive(Component)]
-#[require(Server)]
 pub struct NetcodeServer {
     pub(crate) inner: crate::server::Server<NetcodeServerContext>,
 }
@@ -96,11 +100,13 @@ impl NetcodeServerPlugin {
     /// Takes packets from the Link, process them through the server,
     /// and buffer them back into the link to be sent by the IO
     fn send(
-        mut server_query: Query<(&mut NetcodeServer, &Server), (With<Server>, Without<Stopped>)>,
+        mut transport_query: Query<(Entity, &mut NetcodeServer, &TransportOf), Without<Stopped>>,
+        server_query: Query<&Server>,
         client_query: Query<
             (
                 Entity,
                 &mut Link,
+                &ViaTransport,
                 Option<&RemoteId>,
                 Option<&Connected>,
                 Option<&Disconnecting>,
@@ -116,10 +122,16 @@ impl NetcodeServerPlugin {
         // the same clients (because each Link is uniquely associated with a single server)
         // This allow us to iterate in parallel over all servers
         let client_query = Arc::new(client_query);
-        server_query
+        transport_query
             .par_iter_mut()
             // .iter_mut()
-            .for_each(|(mut netcode_server, server)| {
+            .for_each(|(transport_entity, mut netcode_server, transport_of)| {
+                // Look up the Server entity via TransportOf
+                let Ok(server) = server_query.get(transport_of.server) else {
+                    error!("NetcodeServer has TransportOf pointing to non-existent Server entity");
+                    return;
+                };
+                
                 // SAFETY: we know that each client is unique to a single server so we won't
                 //  violate aliasing rules
                 let mut client_query = unsafe { client_query.reborrow_unsafe() };
@@ -127,8 +139,11 @@ impl NetcodeServerPlugin {
                 // SAFETY: we know that the entities of a relationship are unique
                 let unique_slice =
                     unsafe { UniqueEntitySlice::from_slice_unchecked(server.collection()) };
-                client_query.iter_many_unique_mut(unique_slice).for_each(
-                    |(entity, mut link, remote_id, connected, disconnecting)| {
+                client_query.iter_many_unique_mut(unique_slice)
+                    // Only process clients that came through THIS transport
+                    .filter(|(_, _, via_transport, _, _, _)| via_transport.transport == transport_entity)
+                    .for_each(
+                    |(entity, mut link, _via_transport, remote_id, connected, disconnecting)| {
                         // TODO: we can be here while the link has been established, but the client is not yet connected
                         //  so the PeerId is not Netcode! I think we should just error?
 
@@ -189,12 +204,13 @@ impl NetcodeServerPlugin {
     fn receive(
         parallel_commands: ParallelCommands,
         real_time: Res<Time<Real>>,
-        mut server_query: Query<
-            (Entity, &mut NetcodeServer, &mut Server, Has<Stopping>),
+        mut transport_query: Query<
+            (Entity, &mut NetcodeServer, &TransportOf, Has<Stopping>),
             Without<Stopped>,
         >,
+        mut server_query: Query<&mut Server>,
         link_query: Query<
-            (Entity, &mut Link),
+            (Entity, &mut Link, &ViaTransport),
             (With<LinkOf>, Without<HostClient>, Without<SkipNetcode>),
         >,
     ) {
@@ -206,8 +222,16 @@ impl NetcodeServerPlugin {
         let link_query = Arc::new(link_query);
 
         // receive packets from the link and process them through the server
-        server_query.par_iter_mut().for_each(
-            |(server_entity, mut netcode_server, mut server, stopping)| {
+        transport_query.par_iter_mut().for_each(
+            |(transport_entity, mut netcode_server, transport_of, stopping)| {
+                // Look up the Server entity via TransportOf
+                // SAFETY: we know the server_query won't conflict because each transport has a unique server
+                let mut server_query = unsafe { server_query.reborrow_unsafe() };
+                let Ok(mut server) = server_query.get_mut(transport_of.server) else {
+                    error!("NetcodeServer has TransportOf pointing to non-existent Server entity");
+                    return;
+                };
+                
                 parallel_commands.command_scope(|mut c| {
                     // SAFETY: we know that each client is unique to a single server so we won't
                     //  violate aliasing rules
@@ -223,7 +247,9 @@ impl NetcodeServerPlugin {
                         unsafe { UniqueEntitySlice::from_slice_unchecked(server.collection()) };
                     link_query
                         .iter_many_unique_mut(unique_slice)
-                        .for_each(|(entity, mut link)| {
+                        // Only process clients that came through THIS transport
+                        .filter(|(_, _, via_transport)| via_transport.transport == transport_entity)
+                        .for_each(|(entity, mut link, _via_transport)| {
                             let mut entity_mut = c.entity(entity);
 
                             // #[cfg(feature = "test_utils")]
@@ -279,7 +305,7 @@ impl NetcodeServerPlugin {
                         });
                     if stopping {
                         // after we sent disconnection packets, we can stop the server
-                        c.entity(server_entity).insert(Stopped);
+                        c.entity(transport_entity).insert(Stopped);
                     }
                 });
             },
@@ -295,9 +321,10 @@ impl NetcodeServerPlugin {
     fn stop(
         trigger: On<Stop>,
         mut commands: Commands,
-        mut query: Query<(Entity, &mut NetcodeServer, &Server), Without<Stopped>>,
+        mut query: Query<(Entity, &mut NetcodeServer, &TransportOf), Without<Stopped>>,
+        server_query: Query<&Server>,
         mut link_query: Query<
-            (Entity, &mut Link, &RemoteId),
+            (Entity, &mut Link, &RemoteId, &ViaTransport),
             (
                 With<ClientOf>,
                 With<Connected>,
@@ -306,19 +333,31 @@ impl NetcodeServerPlugin {
             ),
         >,
     ) -> Result {
-        if let Ok((server_entity, mut netcode_server, server)) = query.get_mut(trigger.entity) {
+        if let Ok((transport_entity, mut netcode_server, transport_of)) =
+            query.get_mut(trigger.entity)
+        {
+            let Ok(server) = server_query.get(transport_of.server) else {
+                error!(
+                    "Transport entity {:?} has TransportOf pointing to non-existent Server {:?}",
+                    transport_entity, transport_of.server
+                );
+                return Ok(());
+            };
             info!("Stopping netcode server");
 
             // TODO: should we stop the io?
             // // stop the ServerIo that is on this entity (for example webtransport server)
-            // commands.trigger_targets(Unlink, server_entity);
-            commands.entity(server_entity).insert(Stopping);
+            // commands.trigger_targets(Unlink, transport_entity);
+            commands.entity(transport_entity).insert(Stopping);
 
             // SAFETY: we know that the list of client entities are unique because it is a Relationship
             let unique_slice =
                 unsafe { UniqueEntitySlice::from_slice_unchecked(server.collection()) };
-            link_query.iter_many_unique_mut(unique_slice).try_for_each(
-                |(entity, mut link, remote_peer_id)| {
+            link_query.iter_many_unique_mut(unique_slice)
+                // Only disconnect clients that came through THIS transport
+                .filter(|(_, _, _, via_transport)| via_transport.transport == transport_entity)
+                .try_for_each(
+                |(entity, mut link, remote_peer_id, _via_transport)| {
                     let PeerId::Netcode(client_id) = remote_peer_id.0 else {
                         error!("Client {:?} is not a Netcode client", remote_peer_id);
                         return Err(crate::error::Error::UnknownClient(remote_peer_id.0));

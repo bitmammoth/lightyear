@@ -39,6 +39,38 @@ pub struct PlayerPosition(pub Vec2);
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PlayerColor(pub Color);
 
+// ============ Channels ============
+
+/// Default channel for replication
+pub struct DefaultChannel;
+
+// ============ Messages ============
+
+/// Message sent from server to specific client
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ServerToClientMessage {
+    pub content: String,
+}
+
+/// Message sent from server to ALL clients
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BroadcastMessage {
+    pub content: String,
+}
+
+/// Message sent from client to server
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ClientToServerMessage {
+    pub content: String,
+}
+
+/// Message sent from client to server, to be forwarded to another client
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ForwardMessage {
+    pub target_player_id: u64,
+    pub content: String,
+}
+
 // ============ Plugin ============
 
 /// Plugin to register the shared protocol.
@@ -47,10 +79,27 @@ pub struct SharedPlugin;
 
 impl Plugin for SharedPlugin {
     fn build(&self, app: &mut App) {
+        // Register channel
+        app.add_channel::<DefaultChannel>(ChannelSettings {
+            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
+            ..default()
+        })
+        .add_direction(NetworkDirection::Bidirectional);
+
         // Register replicated components
         app.register_component::<Player>();
         app.register_component::<PlayerId>();
         app.register_component::<PlayerPosition>();
         app.register_component::<PlayerColor>();
+
+        // Register messages
+        app.register_message::<ServerToClientMessage>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<BroadcastMessage>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<ClientToServerMessage>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<ForwardMessage>()
+            .add_direction(NetworkDirection::ClientToServer);
     }
 }

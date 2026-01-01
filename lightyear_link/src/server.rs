@@ -13,8 +13,25 @@ use bevy_reflect::Reflect;
 use bevy_utils::prelude::DebugName;
 #[allow(unused_imports)]
 use tracing::{trace, warn};
-// TODO: should we also have a LinkId (remote addr/etc.) that uniquely identifies the link?
 
+// ============================================================================
+// Server - The logical server that all clients connect to
+// ============================================================================
+
+/// The logical server entity that all client connections (LinkOf) point to.
+///
+/// In a multi-transport setup, you spawn ONE Server entity, and multiple
+/// transport entities (UDP, WebTransport, etc.) that feed connections to it.
+///
+/// # Example
+/// ```ignore
+/// // Spawn the logical server
+/// let server = commands.spawn(Server::default()).id();
+///
+/// // Spawn transports that connect to the server
+/// commands.spawn((ServerUdpIo::default(), TransportOf { server }));
+/// commands.spawn((WebTransportServerIo { .. }, TransportOf { server }));
+/// ```
 #[derive(Component, Default, Debug, PartialEq, Eq, Reflect)]
 #[component(on_add = Server::on_add)]
 #[relationship_target(relationship = LinkOf, linked_spawn)]
@@ -157,6 +174,85 @@ impl LinkOf {
                 entity,
             );
         }
+    }
+}
+
+// ============================================================================
+// TransportOf - Simple component linking transport to Server
+// ============================================================================
+
+/// Component that links a transport entity to its Server.
+///
+/// When a transport (UDP, WebTransport, etc.) receives a new client connection,
+/// it should spawn a `LinkOf { server: transport_of.server }` pointing to the
+/// Server entity, NOT the transport entity itself.
+///
+/// # Example
+/// ```ignore
+/// // Transport entity reads its TransportOf to know which Server to use
+/// fn on_new_connection(
+///     transport_query: Query<&TransportOf>,
+/// ) {
+///     let transport_of = transport_query.get(transport_entity).unwrap();
+///     commands.spawn(LinkOf { server: transport_of.server });
+/// }
+/// ```
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+pub struct TransportOf {
+    /// The Server entity this transport feeds connections to
+    pub server: Entity,
+}
+
+impl TransportOf {
+    pub fn new(server: Entity) -> Self {
+        Self { server }
+    }
+}
+
+// ============================================================================
+// ViaTransport - Tracks which transport entity spawned a client LinkOf
+// ============================================================================
+
+/// Component added to `LinkOf` entities to track which transport they came from.
+///
+/// This is essential for multi-transport setups where multiple transports
+/// (UDP, WebTransport, etc.) feed into a single Server. Each transport's
+/// protocol layer (e.g., NetcodeServer) needs to know which clients belong to it.
+///
+/// # Example
+/// ```ignore
+/// // When spawning a new client connection from a transport:
+/// commands.spawn((
+///     LinkOf { server: transport_of.server },
+///     ViaTransport { transport: transport_entity },
+///     Link::new(None),
+///     UdpLinkOfIO,  // Transport-specific marker
+/// ));
+///
+/// // Protocol layers can filter clients by transport:
+/// fn send(
+///     transport_query: Query<(Entity, &NetcodeServer, &TransportOf)>,
+///     link_query: Query<(&Link, &ViaTransport), With<LinkOf>>,
+/// ) {
+///     for (transport_entity, netcode, transport_of) in transport_query.iter() {
+///         // Only process clients that came through THIS transport
+///         for (link, via) in link_query.iter() {
+///             if via.transport == transport_entity {
+///                 // This client belongs to this transport
+///             }
+///         }
+///     }
+/// }
+/// ```
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+pub struct ViaTransport {
+    /// The transport entity that this client connected through
+    pub transport: Entity,
+}
+
+impl ViaTransport {
+    pub fn new(transport: Entity) -> Self {
+        Self { transport }
     }
 }
 

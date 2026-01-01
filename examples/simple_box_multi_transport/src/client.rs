@@ -11,7 +11,10 @@ use lightyear::netcode::Key;
 use lightyear::prelude::client::*;
 use lightyear::prelude::client::input::InputSystems;
 use lightyear::prelude::input::native::*;
-use lightyear::prelude::{*, Replicated};
+use lightyear::prelude::{
+    Authentication, LocalAddr, PeerAddr, Link, ReplicationReceiver, 
+    PredictionManager, UdpIo, Predicted, Interpolated, Replicated,
+};
 
 pub const UDP_PORT: u16 = 5000;
 pub const WEBTRANSPORT_PORT: u16 = 5001;
@@ -36,7 +39,7 @@ pub struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         // Client systems  
-        app.add_systems(Startup, (startup_client, setup_camera));
+        app.add_systems(Startup, startup_client);
         app.add_systems(
             FixedPreUpdate,
             buffer_input.in_set(InputSystems::WriteClientInputs),
@@ -47,16 +50,28 @@ impl Plugin for ClientPlugin {
         app.add_observer(on_disconnected);
         app.add_observer(handle_predicted_spawn);
         app.add_observer(handle_interpolated_spawn);
-        app.add_observer(on_replicated_entity);
+        // Debug observers
+        app.add_observer(on_replicated);
         app.add_observer(on_player_added);
-        app.add_observer(on_player_position_added);
         app.add_observer(on_predicted_added);
-        app.add_systems(Update, (draw_players, log_players));
+        app.add_observer(on_interpolated_added);
     }
 }
 
-fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+fn on_replicated(trigger: On<Add, Replicated>) {
+    info!("📥 Replicated marker added to entity {:?}", trigger.entity);
+}
+
+fn on_player_added(trigger: On<Add, Player>) {
+    info!("🎮 Player component added to entity {:?}", trigger.entity);
+}
+
+fn on_predicted_added(trigger: On<Add, Predicted>) {
+    info!("🔮 Predicted marker added to entity {:?}", trigger.entity);
+}
+
+fn on_interpolated_added(trigger: On<Add, Interpolated>) {
+    info!("👤 Interpolated marker added to entity {:?}", trigger.entity);
 }
 
 fn on_connecting(trigger: On<Add, Connecting>, names: Query<&Name>) {
@@ -153,10 +168,20 @@ fn startup_client(mut commands: Commands, config: Res<ClientConfig>) -> Result {
 
 /// Read keyboard input and buffer it for sending to server
 fn buffer_input(
-    mut query: Query<&mut ActionState<Inputs>, With<InputMarker<Inputs>>>,
+    mut query: Query<(Entity, &mut ActionState<Inputs>), With<InputMarker<Inputs>>>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut logged: Local<bool>,
 ) {
-    for mut action_state in query.iter_mut() {
+    if !*logged {
+        let count = query.iter().count();
+        info!("🎮 buffer_input: Found {} entities with ActionState+InputMarker", count);
+        if count == 0 {
+            info!("   ⚠️ No entities to buffer inputs for!");
+        }
+        *logged = true;
+    }
+    
+    for (entity, mut action_state) in query.iter_mut() {
         let mut direction = Direction {
             up: false,
             down: false,
@@ -193,6 +218,7 @@ fn player_movement(
     }
 }
 
+
 /// When we receive a predicted entity (our player), add input marker and adjust color
 fn handle_predicted_spawn(
     trigger: On<Add, PlayerId>,
@@ -207,9 +233,11 @@ fn handle_predicted_spawn(
             ..Hsva::from(color.0)
         };
         color.0 = Color::from(hsva);
-        info!("🎯 Predicted player spawned: {:?}", entity);
-        // Add InputMarker so this entity receives inputs
-        commands.entity(entity).insert(InputMarker::<Inputs>::default());
+        // Add InputMarker AND ActionState so this entity can receive and buffer inputs
+        commands.entity(entity).insert((
+            InputMarker::<Inputs>::default(),
+            ActionState::<Inputs>::default(),
+        ));
     }
 }
 
@@ -225,71 +253,5 @@ fn handle_interpolated_spawn(
             ..Hsva::from(color.0)
         };
         color.0 = Color::from(hsva);
-        info!("👤 Interpolated player spawned: {:?}", trigger.entity);
     }
-}
-
-/// Draw all players using gizmos
-fn draw_players(mut gizmos: Gizmos, players: Query<(Entity, &PlayerPosition, &PlayerColor), With<Player>>) {
-    for (entity, position, color) in &players {
-        gizmos.rect_2d(
-            Isometry2d::from_translation(position.0),
-            Vec2::ONE * 50.0,
-            color.0,
-        );
-    }
-}
-
-/// Log player count periodically
-fn log_players(
-    players: Query<(Entity, &PlayerPosition, Option<&Predicted>, Option<&Interpolated>), With<Player>>,
-    time: Res<Time>,
-    mut last_log: Local<f32>,
-) {
-    let now = time.elapsed_secs();
-    if now - *last_log > 2.0 {
-        *last_log = now;
-        let count = players.iter().count();
-        if count > 0 {
-            info!("📊 Client sees {} player entities:", count);
-            for (entity, pos, predicted, interpolated) in players.iter() {
-                let kind = match (predicted.is_some(), interpolated.is_some()) {
-                    (true, _) => "Predicted",
-                    (_, true) => "Interpolated",
-                    _ => "Confirmed",
-                };
-                info!("   {:?} ({}) at ({:.1}, {:.1})", entity, kind, pos.0.x, pos.0.y);
-            }
-        }
-    }
-}
-
-/// Log when any replicated entity arrives
-fn on_replicated_entity(trigger: On<Add, Replicated>, names: Query<&Name>) {
-    let name = names.get(trigger.entity).map(|n| n.as_str()).unwrap_or("unnamed");
-    info!("📥 Replicated entity received: {:?} ({})", trigger.entity, name);
-}
-
-/// Log when Player component is added
-fn on_player_added(trigger: On<Add, Player>, query: Query<(Option<&PlayerId>, Option<&Predicted>, Option<&Interpolated>)>) {
-    if let Ok((id, predicted, interpolated)) = query.get(trigger.entity) {
-        let kind = match (predicted.is_some(), interpolated.is_some()) {
-            (true, _) => "Predicted",
-            (_, true) => "Interpolated",
-            _ => "Confirmed",
-        };
-        info!("🎮 Player component added to {:?} ({}) - ID: {:?}", trigger.entity, kind, id);
-    }
-}
-
-/// Log when PlayerPosition is added
-fn on_player_position_added(trigger: On<Add, PlayerPosition>, query: Query<&PlayerPosition>) {
-    if let Ok(pos) = query.get(trigger.entity) {
-        info!("📍 PlayerPosition added to {:?}: ({:.1}, {:.1})", trigger.entity, pos.0.x, pos.0.y);
-    }
-}
-
-/// Log when Predicted is added  
-fn on_predicted_added(trigger: On<Add, Predicted>) {
-    info!("🔮 Predicted marker added to {:?}", trigger.entity);
 }

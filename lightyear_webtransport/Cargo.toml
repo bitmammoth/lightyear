@@ -19,7 +19,7 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 [features]
 default = ["self-signed"]
 client = ["aeronet_webtransport/client"]
-server = ["aeronet_webtransport/server", "bevy_reflect/std"]
+server = ["aeronet_webtransport/server", "bevy_reflect/std", "lightyear_connection"]
 
 ## Enables `wtransport/self-signed`, allowing you to generate self-signed certificates easily for
 ## use in a server.
@@ -40,6 +40,7 @@ aeronet_webtransport.workspace = true
 aeronet_io.workspace = true
 lightyear_link.workspace = true
 lightyear_aeronet.workspace = true
+lightyear_connection = { workspace = true, features = ["server"], optional = true }
 
 tracing.workspace = true
 

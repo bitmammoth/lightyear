@@ -101,10 +101,10 @@ fn handle_connected(
     };
     let client_id = remote_id.0;
     
-    // Spawn position based on client ID (spread them out)
+    // Spawn at origin for testing - spread slightly based on client ID
     let id_bits = client_id.to_bits();
-    let spawn_x = ((id_bits % 5) as f32 - 2.0) * 100.0;
-    let spawn_y = ((id_bits / 5 % 5) as f32 - 2.0) * 100.0;
+    let spawn_x = ((id_bits % 3) as f32 - 1.0) * 60.0;  // -60, 0, or +60
+    let spawn_y = 0.0;  // All at y=0 for easy visibility
     
     info!("🎮 Client {:?} connected via {} (link: {:?})", client_id, link_name, trigger.entity);
     info!("   Spawning player at ({:.1}, {:.1})", spawn_x, spawn_y);

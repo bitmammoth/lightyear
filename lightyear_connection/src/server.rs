@@ -148,19 +148,22 @@ impl ConnectionPlugin {
 
 /// RunCondition to check if the app is a server.
 ///
-/// Note that the app could also have a host-client
-pub fn is_server(server_query: Query<(), With<Server>>) -> bool {
-    server_query.single().is_ok()
+/// Uses `ServerRole` resource to determine if any server transport is running.
+/// This works correctly with multi-transport setups (multiple Server entities).
+///
+/// Note that the app could also have a host-client.
+pub fn is_server(server_role: Option<Res<crate::server_role::ServerRole>>) -> bool {
+    server_role.is_some_and(|r| r.is_running())
 }
 
 /// RunCondition to check if the app is a headless server:
-/// - there is an entity with the `Server` component
+/// - the server is running (via ServerRole)
 /// - there are no entities with the `Client` component
 pub fn is_headless_server(
-    server_query: Query<(), With<Server>>,
-    query: Query<(), With<Client>>,
+    server_role: Option<Res<crate::server_role::ServerRole>>,
+    client_query: Query<(), With<Client>>,
 ) -> bool {
-    server_query.single().is_ok() && query.is_empty()
+    server_role.is_some_and(|r| r.is_running()) && client_query.is_empty()
 }
 
 impl Plugin for ConnectionPlugin {

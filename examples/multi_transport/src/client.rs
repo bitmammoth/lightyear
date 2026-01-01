@@ -1,4 +1,9 @@
 //! Client module - connects to server and receives replicated player entities.
+//!
+//! Keyboard Commands:
+//! - S: Send message to server
+//! - F: Send message to server to forward to OTHER client
+//! - P: Show replicated players
 
 use crate::shared::*;
 use bevy::prelude::*;
@@ -27,11 +32,33 @@ pub struct ExampleClientPlugin;
 
 impl Plugin for ExampleClientPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<ClientMessageTimer>();
         app.add_systems(Startup, startup);
         app.add_observer(on_connecting);
         app.add_observer(on_connected);
         app.add_observer(on_disconnected);
-        app.add_systems(Update, (display_new_players, count_replicated_entities));
+        app.add_systems(Update, (
+            display_new_players,
+            count_replicated_entities,
+            auto_send_messages,
+            receive_server_messages,
+        ));
+    }
+}
+
+/// Timer for automatic message testing from client
+#[derive(Resource)]
+struct ClientMessageTimer {
+    timer: Timer,
+    phase: u32,
+}
+
+impl Default for ClientMessageTimer {
+    fn default() -> Self {
+        Self {
+            timer: Timer::from_seconds(5.0, TimerMode::Repeating),
+            phase: 0,
+        }
     }
 }
 
@@ -137,5 +164,87 @@ fn count_replicated_entities(
     if count != *last_count {
         info!("📊 Total replicated players: {}", count);
         *last_count = count;
+    }
+}
+
+/// Automatically send test messages on a timer
+fn auto_send_messages(
+    time: Res<Time>,
+    mut timer: ResMut<ClientMessageTimer>,
+    config: Res<ClientConfig>,
+    mut client_sender_query: Query<&mut MessageSender<ClientToServerMessage>, (With<Client>, With<Connected>)>,
+    mut forward_query: Query<&mut MessageSender<ForwardMessage>, (With<Client>, With<Connected>)>,
+    players: Query<&Player>,
+) {
+    timer.timer.tick(time.delta());
+    
+    if !timer.timer.just_finished() {
+        return;
+    }
+    
+    // Only test when we have 2 players replicated
+    if players.iter().count() < 2 {
+        return;
+    }
+    
+    let transport_name = match config.transport {
+        Transport::Udp => "UDP",
+        Transport::WebTransport => "WebTransport",
+    };
+
+    timer.phase = (timer.phase + 1) % 2;
+    
+    match timer.phase {
+        0 => {
+            // Send message to server
+            info!("📤 {} CLIENT -> SERVER: Sending message", transport_name);
+            for mut sender in client_sender_query.iter_mut() {
+                sender.send::<DefaultChannel>(ClientToServerMessage {
+                    content: format!("Hello from {} client!", transport_name),
+                });
+            }
+        }
+        1 => {
+            // Forward message to OTHER client via server
+            let my_player_id = match config.transport {
+                Transport::Udp => 0,
+                Transport::WebTransport => 1,
+            };
+            let target_player_id = if my_player_id == 0 { 1 } else { 0 };
+            
+            info!("📤 {} CLIENT -> SERVER (forward to Player {}): Sending forward request", 
+                  transport_name, target_player_id);
+            for mut sender in forward_query.iter_mut() {
+                sender.send::<DefaultChannel>(ForwardMessage {
+                    target_player_id,
+                    content: format!("Forwarded message from {} client!", transport_name),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Receive messages from server
+fn receive_server_messages(
+    mut direct_receiver: Query<&mut MessageReceiver<ServerToClientMessage>, With<Client>>,
+    mut broadcast_receiver: Query<&mut MessageReceiver<BroadcastMessage>, With<Client>>,
+    config: Res<ClientConfig>,
+) {
+    let transport_name = match config.transport {
+        Transport::Udp => "UDP",
+        Transport::WebTransport => "WebTransport",
+    };
+
+    for mut receiver in direct_receiver.iter_mut() {
+        for msg in receiver.receive() {
+            info!("📥 {} CLIENT <- SERVER (direct): {}", transport_name, msg.content);
+        }
+    }
+
+    for mut receiver in broadcast_receiver.iter_mut() {
+        for msg in receiver.receive() {
+            info!("📥 {} CLIENT <- SERVER (broadcast): {}", transport_name, msg.content);
+        }
     }
 }

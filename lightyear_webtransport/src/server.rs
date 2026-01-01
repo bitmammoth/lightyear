@@ -10,10 +10,10 @@ use bevy_ecs::prelude::*;
 use core::time::Duration;
 use lightyear_aeronet::server::ServerAeronetPlugin;
 use lightyear_aeronet::{AeronetLinkOf, AeronetPlugin};
-use lightyear_link::prelude::LinkOf;
-use lightyear_link::server::Server;
+use lightyear_connection::prelude::server::IoServer;
+use lightyear_link::prelude::{LinkOf, TransportOf, ViaTransport};
 use lightyear_link::{Link, LinkStart, Linked, Linking};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Allows using [`WebTransportServer`].
 pub struct WebTransportServerPlugin;
@@ -34,10 +34,15 @@ impl Plugin for WebTransportServerPlugin {
     }
 }
 
-/// WebTransport server implementation which listens for client connections,
-/// and coordinates messaging between multiple clients.
+/// Marker component to identify this LinkOf as coming from WebTransport
+#[derive(Component)]
+pub struct WebTransportLinkOfIO;
+
+/// WebTransport server IO component.
 ///
-/// Use [`WebTransportServer::open`] to start opening a server.
+/// This is a transport-only component. It does NOT have a `Server` component.
+/// Instead, it should have a `TransportOf { server }` component pointing to
+/// the logical Server entity that all client LinkOfs should connect to.
 ///
 /// The [`LocalAddr`] component must be inserted to specify the server_addr.
 ///
@@ -45,8 +50,21 @@ impl Plugin for WebTransportServerPlugin {
 /// [`SessionRequest`]. Your app **must** observe this, and use
 /// [`SessionRequest::respond`] to set how the server should respond to this
 /// connection attempt.
+///
+/// # Example
+/// ```ignore
+/// // Spawn the logical server first
+/// let server = commands.spawn(Server::default()).id();
+///
+/// // Then spawn the WebTransport transport pointing to it
+/// commands.spawn((
+///     WebTransportServerIo { certificate },
+///     TransportOf::new(server),
+///     LocalAddr(addr),
+/// ));
+/// ```
 #[derive(Debug, Component)]
-#[require(Server)]
+#[require(IoServer::webtransport())]
 pub struct WebTransportServerIo {
     pub certificate: Identity,
 }
@@ -87,22 +105,34 @@ impl WebTransportServerPlugin {
     //  because the connecting entity adds SessionEndpoint? (and lightyear_aeronet handles that)
     fn on_connection(
         trigger: On<Add, Session>,
-        query: Query<&AeronetLinkOf>,
+        aeronet_query: Query<&AeronetLinkOf>,
+        transport_query: Query<&TransportOf>,
         child_query: Query<(&ChildOf, &PeerAddr), With<WebTransportServerClient>>,
         mut commands: Commands,
     ) {
         if let Ok((child_of, peer_addr)) = child_query.get(trigger.entity)
-            && let Ok(server_link) = query.get(child_of.parent())
+            && let Ok(aeronet_link) = aeronet_query.get(child_of.parent())
         {
+            // aeronet_link.0 is the WebTransportServerIo entity
+            // We need to get its TransportOf to find the actual Server entity
+            let transport_entity = aeronet_link.0;
+            let server_entity = if let Ok(transport_of) = transport_query.get(transport_entity) {
+                transport_of.server
+            } else {
+                warn!("WebTransportServerIo entity {:?} missing TransportOf component", transport_entity);
+                return;
+            };
+            
             let link_entity = commands
                 .spawn((
-                    LinkOf {
-                        server: server_link.0,
-                    },
+                    LinkOf { server: server_entity },
+                    ViaTransport { transport: transport_entity },
                     Link::new(None),
                     PeerAddr(peer_addr.0),
+                    WebTransportLinkOfIO,
                 ))
                 .id();
+            info!(?link_entity, ?server_entity, ?transport_entity, "WebTransport client connected, spawning LinkOf");
             commands.entity(trigger.entity).insert((
                 AeronetLinkOf(link_entity),
                 Name::from("WebTransportClientOf"),

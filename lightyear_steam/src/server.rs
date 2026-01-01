@@ -7,17 +7,16 @@ use aeronet_steam::server::{
 use alloc::format;
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
-use bevy_ecs::relationship::RelationshipTarget;
 use lightyear_aeronet::server::ServerAeronetPlugin;
 use lightyear_aeronet::{AeronetLink, AeronetLinkOf, AeronetPlugin};
 use lightyear_connection::client::{Connected, Disconnected};
 use lightyear_connection::client_of::{ClientOf, SkipNetcode};
+use lightyear_connection::prelude::server::IoServer;
 use lightyear_connection::server::{Start, Started, Stop};
 use lightyear_core::id::{PeerId, RemoteId};
-use lightyear_link::prelude::LinkOf;
-use lightyear_link::server::Server;
+use lightyear_link::prelude::{LinkOf, TransportOf};
 use lightyear_link::{Link, LinkStart, Linked, Linking};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// Enables starting a Steam server
 pub struct SteamServerPlugin;
@@ -43,15 +42,18 @@ impl Plugin for SteamServerPlugin {
     }
 }
 
-/// WebTransport server implementation which listens for client connections,
-/// and coordinates messaging between multiple clients.
+/// Steam server IO component.
+///
+/// This is a transport-only component. It does NOT have a `Server` component.
+/// Instead, it should have a `TransportOf { server }` component pointing to
+/// the logical Server entity that all client LinkOfs should connect to.
 ///
 /// When a client attempts to connect, the server will trigger a
 /// [`SessionRequest`]. Your app **must** observe this, and use
 /// [`SessionRequest::respond`] to set how the server should respond to this
 /// connection attempt.
 #[derive(Debug, Component)]
-#[require(Server)]
+#[require(IoServer::steam())]
 pub struct SteamServerIo {
     pub target: ListenTarget,
     pub config: SessionConfig,
@@ -166,22 +168,29 @@ impl SteamServerPlugin {
 
     fn on_connection(
         trigger: On<Add, Session>,
-        query: Query<&AeronetLinkOf>,
+        aeronet_query: Query<&AeronetLinkOf>,
+        transport_query: Query<&TransportOf>,
         child_query: Query<(&ChildOf, &SteamNetServerClient)>,
         mut commands: Commands,
     ) {
         if let Ok((child_of, steam_conn)) = child_query.get(trigger.entity)
-            && let Ok(server_link) = query.get(child_of.parent())
+            && let Ok(aeronet_link) = aeronet_query.get(child_of.parent())
         {
+            // Get the Server entity from TransportOf
+            let server_entity = if let Ok(transport_of) = transport_query.get(aeronet_link.0) {
+                transport_of.server
+            } else {
+                warn!("SteamServerIo entity {:?} missing TransportOf component", aeronet_link.0);
+                return;
+            };
+            
             trace!(
                 "New Steam connection established with client that has SteamId: {:?}",
                 steam_conn.steam_id()
             );
             let link_entity = commands
                 .spawn((
-                    LinkOf {
-                        server: server_link.0,
-                    },
+                    LinkOf { server: server_entity },
                     Link::new(None),
                     ClientOf,
                     Connected,

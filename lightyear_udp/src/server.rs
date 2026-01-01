@@ -8,7 +8,6 @@ extern crate alloc;
 
 use bevy_app::{App, Plugin, PostUpdate, PreUpdate};
 use bevy_ecs::prelude::*;
-use bevy_ecs::relationship::RelationshipTarget;
 use bevy_ecs::system::ParallelCommands;
 use tracing::{debug, error, info};
 
@@ -17,19 +16,37 @@ use aeronet_io::connection::{LocalAddr, PeerAddr};
 use bevy_platform::collections::{HashMap, hash_map::Entry};
 use bytes::{BufMut, BytesMut};
 use core::net::SocketAddr;
+use lightyear_connection::prelude::server::IoServer;
 use lightyear_core::time::Instant;
-use lightyear_link::prelude::{LinkOf, Server};
+use lightyear_link::prelude::{LinkOf, TransportOf, ViaTransport};
 use lightyear_link::{Link, LinkPlugin, LinkStart, LinkSystems, Linked, Linking, Unlink, Unlinked};
 
 /// Maximum transmission units; maximum size in bytes of a UDP packet
 /// See: <https://gafferongames.com/post/packet_fragmentation_and_reassembly/>
 pub(crate) const MTU: usize = 1472;
 
-/// Component to start a UdpServer.
+/// UDP Server IO component.
+///
+/// This is a transport-only component. It does NOT have a `Server` component.
+/// Instead, it should have a `TransportOf { server }` component pointing to
+/// the logical Server entity that all client LinkOfs should connect to.
 ///
 /// The [`LocalAddr`] component is required to specify the local SocketAddr to bind.
+///
+/// # Example
+/// ```ignore
+/// // Spawn the logical server first
+/// let server = commands.spawn(Server::default()).id();
+///
+/// // Then spawn the UDP transport pointing to it
+/// commands.spawn((
+///     ServerUdpIo::default(),
+///     TransportOf::new(server),
+///     LocalAddr(addr),
+/// ));
+/// ```
 #[derive(Component)]
-#[require(Server)]
+#[require(IoServer::udp())]
 pub struct ServerUdpIo {
     socket: Option<std::net::UdpSocket>,
     buffer: BytesMut,
@@ -93,48 +110,43 @@ impl ServerUdpPlugin {
     }
 
     fn send(
-        mut server_query: Query<(&mut ServerUdpIo, &Server), With<Linked>>,
+        mut transport_query: Query<&mut ServerUdpIo, With<Linked>>,
         mut link_query: Query<(&mut Link, &PeerAddr), With<UdpLinkOfIO>>,
     ) {
+        // For each UDP transport, send to all UDP clients (marked with UdpLinkOfIO)
         // TODO: parallelize
-        server_query
-            .iter_mut()
-            .for_each(|(mut server_udp_io, server)| {
-                server.collection().iter().for_each(|client_entity| {
-                    let Some((mut link, remote_addr)) = link_query.get_mut(*client_entity).ok()
-                    else {
-                        // Not all server links are Udp Links, so we might not want this to ever print
-                        debug!("Client entity {} not found in link query", client_entity);
-                        return;
-                    };
-
-                    link.send.drain().for_each(|send_payload| {
-                        server_udp_io
-                            .socket
-                            .as_mut()
-                            .unwrap()
-                            .send_to(send_payload.as_ref(), remote_addr.0)
-                            .inspect_err(|e| {
-                                error!("Error sending UDP packet to {}: {}", remote_addr.0, e);
-                            })
-                            .ok();
-                    });
+        for mut server_udp_io in transport_query.iter_mut() {
+            for (mut link, remote_addr) in link_query.iter_mut() {
+                link.send.drain().for_each(|send_payload| {
+                    server_udp_io
+                        .socket
+                        .as_mut()
+                        .unwrap()
+                        .send_to(send_payload.as_ref(), remote_addr.0)
+                        .inspect_err(|e| {
+                            error!("Error sending UDP packet to {}: {}", remote_addr.0, e);
+                        })
+                        .ok();
                 });
-            });
+            }
+        }
     }
 
     fn receive(
         commands: ParallelCommands,
-        mut server_query: Query<(Entity, &mut ServerUdpIo), With<Linked>>,
+        mut transport_query: Query<(Entity, &mut ServerUdpIo, &TransportOf), With<Linked>>,
         // TODO: we want to have With<Linked> here, but that would mean that if a client sends 2 packets in a row
         //  for the first one we spawn them, and for the second one the query will return False.
         //  maybe have a separate Vec for new addresses, and for these we don't require Linked?
         link_query: Query<Option<&mut Link>>,
     ) {
-        server_query
+        transport_query
             // TODO: would par_iter_mut be better here?
             .iter_mut()
-            .for_each(|(server_entity, mut server_udp_io)| {
+            .for_each(|(transport_entity, mut server_udp_io, transport_of)| {
+                // Get the Server entity that LinkOfs should point to
+                let server_entity = transport_of.server;
+                
                 // SAFETY: we know that each ServerUdpIo will target different Link entities, so there won't be any aliasing
                 let mut link_query = unsafe { link_query.reborrow_unsafe() };
 
@@ -218,6 +230,9 @@ impl ServerUdpPlugin {
                                                 LinkOf {
                                                     server: server_entity,
                                                 },
+                                                ViaTransport {
+                                                    transport: transport_entity,
+                                                },
                                                 link,
                                                 Linked,
                                                 PeerAddr(address),
@@ -225,7 +240,7 @@ impl ServerUdpPlugin {
                                                 // TODO: should we add LocalAddr?
                                             ))
                                             .id();
-                                        info!(?entity, ?server_entity, "Received UDP packet from new address {address}, Spawn new LinkOf");
+                                        info!(?entity, ?server_entity, ?transport_entity, "Received UDP packet from new address {address}, Spawn new LinkOf");
                                         vacant.insert(LinkOfStatus::Spawning(entity));
                                     });
                                     continue;

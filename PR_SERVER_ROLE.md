@@ -1,125 +1,232 @@
-# RFC: ServerRole Resource for Multi-Transport Support
+# Multi-Transport Architecture: FishNet-Style Single Server
 
 ## Summary
 
-This PR introduces a `ServerRole` resource that represents the "logical server" independent of IO transport types, enabling cleaner multi-transport architectures (e.g., simultaneous Steam + UDP + WebTransport connections).
+This PR implements a **FishNet/Mirror-style multi-transport architecture** where there is ONE logical `Server` entity and multiple transport entities that feed connections to it via `TransportOf`.
 
-## Motivation
+## FishNet → Lightyear Architecture Mapping
 
-Currently, each IO transport type (Steam, UDP, WebTransport) creates its own `Server` entity. This causes issues when an application wants to run multiple transports simultaneously:
+| FishNet (Unity OOP) | Lightyear (Bevy ECS) | Notes |
+|---------------------|---------------------|-------|
+| `NetworkManager` (GameObject) | **Server entity** with `Server` component | Singleton-ish, relationship target for all `LinkOf` |
+| `NetworkManager.TransportManager` | **Queries over transports** with `TransportOf` | ECS iterates all transports naturally |
+| `NetworkManager.ServerManager` | Systems in `lightyear_link`/`lightyear_replication` | Logic in systems, not objects |
+| `NetworkManager.ClientManager` | Systems + `LinkOf` relationships | Each client = entity with `LinkOf` |
+| `Transport` (abstract class) | **Transport marker components** (`ServerUdpIo`, etc.) | Each transport = entity |
+| `Multipass` (Transport wrapper) | **Multiple transport entities + `TransportOf`** | ECS handles multi-transport naturally! |
+| `Multipass._transports[]` | Query for all `(TransportOf, &mut TransportIo)` | |
+| `Multipass.multipassId` → transportId mapping | `LinkOf` entity → transport marker component | Each link knows its transport via marker |
+| `NetworkConnection` | **Entity with `LinkOf`** + transport-specific marker | `UdpLinkOfIO`, `WebTransportLinkOfIO`, etc. |
 
-1. **Multiple Server entities** - Which one is "the" server for game logic?
-2. **Duplicate state** - Each Server could theoretically have its own timeline/state
-3. **Confusing queries** - Systems need to query all Server entities or pick one arbitrarily
+### Key Insight: Bevy ECS is Naturally "Multipass"
 
-This is similar to how Unity's FishNet/Mirror handle this - they have a single `NetworkManager` that manages multiple transports.
+In FishNet, `Multipass` exists because they need to wrap multiple transports behind ONE `Transport` interface. They track:
+- `_transports[]` - array of transports  
+- `_multpassIdLookup` - unified multipassId → (transportIndex, transportId)
+- `_transportIdLookup[]` - per-transport transportId → multipassId
 
-### Current Architecture
-```
+**In Bevy ECS, we don't need explicit ID remapping!** The `Server` component automatically collects all `LinkOf` relationships via its `links: Vec<Entity>`. Each client connection is an entity that:
+1. Has `LinkOf { server }` pointing to the ONE Server
+2. Has a transport-specific marker (`UdpLinkOfIO`, `WebTransportLinkOfIO`, etc.)
+
+### Queries for Different Transport Scenarios
+
+\`\`\`rust
+// ALL clients regardless of transport (equivalent to FishNet's ServerManager.Clients)
+Query<(Entity, &LinkOf)>
+
+// UDP clients only  
+Query<(Entity, &LinkOf), With<UdpLinkOfIO>>
+
+// WebTransport clients only
+Query<(Entity, &LinkOf), With<WebTransportLinkOfIO>>
+
+// Get the Server entity and all its clients
+Query<&Server>  // Server.links contains all LinkOf entities
+\`\`\`
+
+## Architecture Diagrams
+
+### Before (Multiple Server Entities)
+\`\`\`
 Server (SteamServerIo) ──── LinkOf (client)
-Server (UdpServerIo) ────── LinkOf (client)
+Server (UdpServerIo) ────── LinkOf (client)  
 Server (WtServerIo) ─────── LinkOf (client)
                             LinkOf (client)
-```
+\`\`\`
 
-### Proposed Architecture  
-```
-ServerRole (Resource) ─── Single logical server identity
-       │
-       ├── Server (SteamServerIo) ──── LinkOf
-       ├── Server (UdpServerIo) ────── LinkOf  
-       └── Server (WtServerIo) ─────── LinkOf, LinkOf
-```
+### After (One Server, Multiple Transports)
+\`\`\`
+        ┌─────────────────────────────────────────────────────┐
+        │               Server Entity                          │
+        │  ┌─────────────────────────────────────────────────┐│
+        │  │ Server { links: [client1, client2, client3, ...] }│
+        │  └─────────────────────────────────────────────────┘│
+        └─────────────────────────────────────────────────────┘
+                              ▲
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+   ┌──────┴──────┐     ┌──────┴──────┐     ┌──────┴──────┐
+   │ UDP Transport│     │ WT Transport │     │ WS Transport│
+   │TransportOf{srv}│   │TransportOf{srv}│   │TransportOf{srv}│
+   └──────────────┘     └──────────────┘     └──────────────┘
+          │                   │                   │
+          ▼                   ▼                   ▼
+   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+   │ LinkOf{srv} │     │ LinkOf{srv} │     │ LinkOf{srv} │
+   │ UdpLinkOfIO │     │WTLinkOfIO   │     │ WSLinkOfIO  │
+   └─────────────┘     └─────────────┘     └─────────────┘
+\`\`\`
 
-## Design
+## Implementation Details
 
-### New Types
+### 1. `TransportOf` Component (lightyear_link/src/server.rs)
 
-```rust
-/// The logical server role - a Resource
-#[derive(Resource)]
-pub struct ServerRole {
-    pub state: ServerRoleState,
+Links a transport entity to its Server.
+
+\`\`\`rust
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+pub struct TransportOf {
+    pub server: Entity,
 }
 
-pub enum ServerRoleState {
-    Stopped,   // No transports running
-    Starting,  // At least one transport starting
-    Running,   // At least one transport running
-    Stopping,  // All transports stopping
+impl TransportOf {
+    pub fn new(server: Entity) -> Self {
+        Self { server }
+    }
+}
+\`\`\`
+
+### 2. `ViaTransport` Component (lightyear_link/src/server.rs)
+
+Tracks which transport entity spawned each client `LinkOf`. Essential for multi-transport setups where each transport's protocol layer (e.g., NetcodeServer) needs to know which clients belong to it.
+
+\`\`\`rust
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+pub struct ViaTransport {
+    pub transport: Entity,
 }
 
-/// Marker for IO transport entities
+impl ViaTransport {
+    pub fn new(transport: Entity) -> Self {
+        Self { transport }
+    }
+}
+\`\`\`
+
+### 3. Transport Entities (example: UDP)
+
+\`\`\`rust
+// ServerUdpIo NO LONGER has #[require(Server)]
 #[derive(Component)]
-pub struct IoServer {
-    pub transport_name: &'static str,
+#[require(IoServer::udp())]  // Just marks it as a server transport
+pub struct ServerUdpIo { ... }
+
+// When spawning new client connections:
+fn receive(transport_entity: Entity, transport_of: &TransportOf, ...) {
+    commands.spawn((
+        LinkOf { server: transport_of.server },  // Points to THE Server
+        ViaTransport { transport: transport_entity },  // Tracks which transport spawned this
+        link,
+        Linked,
+        PeerAddr(address),
+        UdpLinkOfIO,  // Marker for transport type
+    ));
 }
-```
+\`\`\`
 
-### Usage
+### 4. Protocol Layer Filtering (lightyear_netcode/src/server_plugin.rs)
 
-```rust
-// Check if we're a server (game logic)
-fn my_server_system(
-    server_role: Res<ServerRole>,
+The netcode server plugin filters clients by `ViaTransport` to only process clients that came through the same transport:
+
+\`\`\`rust
+fn send(
+    transport_query: Query<(Entity, &mut NetcodeServer, &TransportOf), Without<Stopped>>,
+    server_query: Query<&Server>,
+    client_query: Query<(Entity, &mut Link, &ViaTransport, ...), With<LinkOf>>,
 ) {
-    if server_role.is_running() {
-        // Do server things
+    for (transport_entity, mut netcode_server, transport_of) in transport_query.iter_mut() {
+        let server = server_query.get(transport_of.server)?;
+        
+        // Only process clients that came through THIS transport
+        for (entity, link, via_transport, ...) in client_query.iter_many(server.collection()) {
+            if via_transport.transport == transport_entity {
+                // Process this client - it belongs to this transport's NetcodeServer
+                netcode_server.send(...);
+            }
+        }
     }
 }
+\`\`\`
 
-// Iterate all connected clients regardless of transport
-fn broadcast_to_all(
-    links: Query<&Link, With<Connected>>,
-) {
-    for link in links.iter() {
-        // Send to all clients on any transport
-    }
-}
+### 3. Spawning Multi-Transport Server
 
-// Transport-specific logic
-fn steam_specific(
-    steam_links: Query<&Link, (With<Connected>, With<SteamClientOf>)>,
-) {
-    // Steam-specific handling
-}
-```
+\`\`\`rust
+// Spawn ONE Server entity
+let server = commands.spawn(Server::default()).id();
 
-### Run Conditions
+// Spawn multiple transports pointing to it
+commands.spawn((
+    ServerUdpIo::default(),
+    TransportOf::new(server),
+    LocalAddr(udp_addr),
+));
 
-```rust
-// New run conditions
-pub fn is_server_running(server_role: Option<Res<ServerRole>>) -> bool;
-pub fn has_server_role(server_role: Option<Res<ServerRole>>) -> bool;
-```
+commands.spawn((
+    WebTransportServerIo { ... },
+    TransportOf::new(server),
+    LocalAddr(wt_addr),
+));
 
-## Implementation Plan
+commands.spawn((
+    WebSocketServerIo::default(),
+    TransportOf::new(server),
+    LocalAddr(ws_addr),
+));
+\`\`\`
 
-1. ✅ Add `ServerRole` resource and `ServerRolePlugin`
-2. ⬜ Add `IoServer` component to transport crates (lightyear_udp, lightyear_steam, etc.)
-3. ⬜ Update `is_server` / `is_headless_server` run conditions to use `ServerRole`
-4. ⬜ Update documentation
-5. ⬜ Add integration test with multiple transports
+## Files Changed
+
+### Core
+- `lightyear_link/src/server.rs` - Added `TransportOf` and `ViaTransport` components
+- `lightyear_netcode/src/server_plugin.rs` - Updated queries to use `TransportOf` lookup and `ViaTransport` filtering
+
+### Transports (removed `#[require(Server)]`, use `TransportOf` and add `ViaTransport` to new clients)
+- `lightyear_udp/src/server.rs` - Added `UdpLinkOfIO` marker, spawns with `ViaTransport`
+- `lightyear_webtransport/src/server.rs` - Added `WebTransportLinkOfIO` marker, spawns with `ViaTransport`
+- `lightyear_websocket/src/server.rs` - Added `WebSocketLinkOfIO` marker
+- `lightyear_steam/src/server.rs` - Uses existing `SteamClientOf` marker
+
+### Examples
+- `examples/multi_transport/src/server.rs` - Updated to new architecture
 
 ## Compatibility
 
-This is **additive** and **non-breaking**:
-- Existing code continues to work
-- `Server` entities still function the same way
-- New code can optionally use `ServerRole` for cleaner architecture
+This is a **breaking change** for anyone spawning server transports:
 
-## Related Discussion
+**Before:**
+\`\`\`rust
+commands.spawn((ServerUdpIo::default(), LocalAddr(addr)));
+// Server component was auto-added via #[require(Server)]
+\`\`\`
 
-From NOTES.md:
-> "maybe we just consider all Link entities in the World, because we will basically never have multiple 'logical' Servers"
+**After:**
+\`\`\`rust
+let server = commands.spawn(Server::default()).id();
+commands.spawn((ServerUdpIo::default(), TransportOf::new(server), LocalAddr(addr)));
+\`\`\`
 
-From PROMPT.md:
-> "multiple 'servers' that are still part of a same global server - i.e. global server timeline, multiple Server entities (Websocket, WebTransport, etc.) that each have their own ClientOfs. but otherwise the big 'SERVER' is the same. (it is a resource)"
+## Benefits
 
-This PR implements exactly that vision.
+1. **Entities match across transports** - A player connecting via UDP or WebTransport gets a `LinkOf` pointing to the same `Server` entity
+2. **Clean queries** - Query all clients: `Query<&LinkOf>`, query by transport: `Query<&LinkOf, With<UdpLinkOfIO>>`
+3. **Natural ECS pattern** - No need for FishNet's `Multipass` ID remapping; Bevy relationships handle it
+4. **Single source of truth** - One `Server` entity holds all game state, timelines, etc.
 
-## Questions for Maintainer
+## Next Steps / TODO
 
-1. Should `ServerRole` eventually contain the server's `LocalTimeline` reference?
-2. Should `IoServer` be a required component when `Server` + IO component is added?
-3. How should this interact with the P2P topology plans?
+- [x] Full integration test with multi_transport example - **WORKING!**
+- [ ] Update book documentation
+- [ ] Consider adding `ServerRole` resource for server state (Running/Stopped/etc.)
+- [ ] Consider transport priority/preferences for replication
+- [ ] Add `ViaTransport` to WebSocket transport

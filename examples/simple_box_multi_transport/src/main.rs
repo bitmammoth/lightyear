@@ -24,6 +24,7 @@ use core::time::Duration;
 
 mod client;
 mod protocol;
+mod renderer;
 mod server;
 mod shared;
 
@@ -71,17 +72,17 @@ fn main() {
 
 fn run_server() {
     App::new()
-        .add_plugins(MinimalPlugins)
-        .add_plugins(bevy::log::LogPlugin {
+        .add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
             level: bevy::log::Level::INFO,
-            filter: "wgpu=error,naga=error".to_string(),
+            filter: "wgpu=error,naga=error,bevy_render=error,bevy_ecs=warn,bevy_app=warn,bevy_winit=warn,bevy_asset=warn".to_string(),
             ..default()
-        })
+        }))
         .add_plugins(lightyear::prelude::server::ServerPlugins {
             tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
         })
         .add_plugins(SharedPlugin)
         .add_plugins(server::ServerPlugin)
+        .add_plugins(renderer::RendererPlugin { is_server: true })
         .run();
 }
 
@@ -113,5 +114,6 @@ fn run_client(transport: TransportArg, cert: Option<String>) {
         })
         .add_plugins(SharedPlugin)
         .add_plugins(client::ClientPlugin)
+        .add_plugins(renderer::RendererPlugin { is_server: false })
         .run();
 }
