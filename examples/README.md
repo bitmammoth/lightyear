@@ -34,6 +34,7 @@ The top level `Cargo.toml` workspace defines the deps that examples can use and 
 - `auth`: an example that shows how a client can get a `ConnectToken` to connect to a server
 - `lobby`: an example that shows how the network topology can be changed at runtime.
   Every client can potentially act as a host for the game (instead of the dedicated server).
+- `multi_transport`: **comprehensive example demonstrating a single server accepting connections via UDP, WebTransport, and WebSocket simultaneously**. Shows transport decoupling with `TransportOf`, player spawning, prediction/interpolation, inputs, and messaging.
 
 ## Running an example
 
