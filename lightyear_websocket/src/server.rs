@@ -9,7 +9,7 @@ use bevy_ecs::prelude::*;
 use lightyear_aeronet::server::ServerAeronetPlugin;
 use lightyear_aeronet::{AeronetLinkOf, AeronetPlugin};
 use lightyear_connection::prelude::server::IoServer;
-use lightyear_link::prelude::{LinkOf, TransportOf};
+use lightyear_link::prelude::{LinkOf, TransportOf, ViaTransport};
 use lightyear_link::{Link, LinkStart, Linked, Linking};
 use tracing::{info, warn};
 
@@ -89,14 +89,20 @@ impl WebSocketServerPlugin {
                 return;
             };
             
+            // The transport entity is the WebSocketServerIo entity
+            let transport_entity = aeronet_link.0;
+            
             let link_entity = commands
                 .spawn((
                     LinkOf { server: server_entity },
+                    ViaTransport::new(transport_entity),
                     Link::new(None),
                     PeerAddr(peer_addr.0),
                     WebSocketLinkOfIO,
                 ))
                 .id();
+            info!("WebSocket client connected, spawning LinkOf link_entity={:?} server_entity={:?} transport_entity={:?}", 
+                  link_entity, server_entity, transport_entity);
             commands
                 .entity(trigger.entity)
                 .insert((AeronetLinkOf(link_entity), Name::from("WebSocketClientOf")));

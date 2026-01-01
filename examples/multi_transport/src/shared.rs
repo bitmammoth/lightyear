@@ -15,9 +15,11 @@ pub const SERVER_REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const UDP_PORT: u16 = 5000;
 pub const WEBTRANSPORT_PORT: u16 = 5001;
+pub const WEBSOCKET_PORT: u16 = 5002;
 
 pub const UDP_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), UDP_PORT);
 pub const WEBTRANSPORT_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBTRANSPORT_PORT);
+pub const WEBSOCKET_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBSOCKET_PORT);
 
 // ============ Components ============
 
@@ -67,8 +69,19 @@ pub struct ClientToServerMessage {
 /// Message sent from client to server, to be forwarded to another client
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ForwardMessage {
-    pub target_player_id: u64,
+    pub from_name: String,
+    pub target_name: String,
     pub content: String,
+    pub is_reply: bool,  // True if this is a reply to a forwarded message
+}
+
+/// Message forwarded from another client (via server)
+/// Contains sender info so recipient can reply
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ForwardedMessage {
+    pub from_name: String,
+    pub content: String,
+    pub is_reply: bool,  // True if this is a reply (don't reply to replies)
 }
 
 // ============ Plugin ============
@@ -96,6 +109,8 @@ impl Plugin for SharedPlugin {
         app.register_message::<ServerToClientMessage>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<BroadcastMessage>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<ForwardedMessage>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ClientToServerMessage>()
             .add_direction(NetworkDirection::ClientToServer);

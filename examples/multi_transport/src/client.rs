@@ -1,9 +1,5 @@
 //! Client module - connects to server and receives replicated player entities.
 //!
-//! Keyboard Commands:
-//! - S: Send message to server
-//! - F: Send message to server to forward to OTHER client
-//! - P: Show replicated players
 
 use crate::shared::*;
 use bevy::prelude::*;
@@ -13,12 +9,14 @@ use lightyear::connection::client::{Connected, Disconnected, Connecting};
 use lightyear::netcode::Key;
 use lightyear::prelude::client::*;
 use lightyear::prelude::*;
+use lightyear::websocket::prelude::client::ClientConfig as WebSocketClientConfig;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Transport {
     #[default]
     Udp,
     WebTransport,
+    WebSocket,
 }
 
 #[derive(Resource)]
@@ -116,7 +114,9 @@ fn startup(mut commands: Commands, config: Res<ClientConfig>) -> Result {
                 private_key: Key::default(),
                 protocol_id: 0,
             };
-            let cert_digest = config.cert_digest.clone().expect("WebTransport requires cert_digest");
+            let cert_digest_raw = config.cert_digest.clone().expect("WebTransport requires cert_digest");
+            // Remove colons if present (server outputs colon-separated format)
+            let cert_digest = cert_digest_raw.replace(":", "");
             let client = commands
                 .spawn((
                     Client::default(),
@@ -129,6 +129,32 @@ fn startup(mut commands: Commands, config: Res<ClientConfig>) -> Result {
                         certificate_digest: cert_digest,
                     },
                     Name::new("WebTransportClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
+        }
+        Transport::WebSocket => {
+            info!("🔌 Connecting via WebSocket to {}", WEBSOCKET_SERVER_ADDR);
+            let auth = Authentication::Manual {
+                server_addr: WEBSOCKET_SERVER_ADDR,
+                client_id: config.client_id,
+                private_key: Key::default(),
+                protocol_id: 0,
+            };
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(WEBSOCKET_SERVER_ADDR),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(auth, NetcodeConfig::default())?,
+                    WebSocketClientIo {
+                        config: WebSocketClientConfig::builder()
+                            .with_no_cert_validation(),
+                        scheme: WebSocketScheme::Secure,
+                    },
+                    Name::new("WebSocketClient"),
                 ))
                 .id();
             commands.trigger(Connect { entity: client });
@@ -182,14 +208,15 @@ fn auto_send_messages(
         return;
     }
     
-    // Only test when we have 2 players replicated
-    if players.iter().count() < 2 {
+    // Only test when we have 3 players replicated (all transports connected)
+    if players.iter().count() < 3 {
         return;
     }
     
-    let transport_name = match config.transport {
-        Transport::Udp => "UDP",
-        Transport::WebTransport => "WebTransport",
+    let (my_name, targets) = match config.transport {
+        Transport::Udp => ("UDP", vec!["WT", "WS"]),
+        Transport::WebTransport => ("WT", vec!["UDP", "WS"]),
+        Transport::WebSocket => ("WS", vec!["UDP", "WT"]),
     };
 
     timer.phase = (timer.phase + 1) % 2;
@@ -197,28 +224,24 @@ fn auto_send_messages(
     match timer.phase {
         0 => {
             // Send message to server
-            info!("📤 {} CLIENT -> SERVER: Sending message", transport_name);
             for mut sender in client_sender_query.iter_mut() {
                 sender.send::<DefaultChannel>(ClientToServerMessage {
-                    content: format!("Hello from {} client!", transport_name),
+                    content: format!("Hello Server from {}!", my_name),
                 });
             }
         }
         1 => {
-            // Forward message to OTHER client via server
-            let my_player_id = match config.transport {
-                Transport::Udp => 0,
-                Transport::WebTransport => 1,
-            };
-            let target_player_id = if my_player_id == 0 { 1 } else { 0 };
-            
-            info!("📤 {} CLIENT -> SERVER (forward to Player {}): Sending forward request", 
-                  transport_name, target_player_id);
-            for mut sender in forward_query.iter_mut() {
-                sender.send::<DefaultChannel>(ForwardMessage {
-                    target_player_id,
-                    content: format!("Forwarded message from {} client!", transport_name),
-                });
+            // Forward message to ALL other clients via server
+            for target in &targets {
+                info!("📤 {} -> {} (via SERVER): Hello!", my_name, target);
+                for mut sender in forward_query.iter_mut() {
+                    sender.send::<DefaultChannel>(ForwardMessage {
+                        from_name: my_name.to_string(),
+                        target_name: target.to_string(),
+                        content: format!("Hello from {}!", my_name),
+                        is_reply: false,
+                    });
+                }
             }
         }
         _ => {}
@@ -229,22 +252,47 @@ fn auto_send_messages(
 fn receive_server_messages(
     mut direct_receiver: Query<&mut MessageReceiver<ServerToClientMessage>, With<Client>>,
     mut broadcast_receiver: Query<&mut MessageReceiver<BroadcastMessage>, With<Client>>,
+    mut forwarded_receiver: Query<&mut MessageReceiver<ForwardedMessage>, With<Client>>,
+    mut forward_sender: Query<&mut MessageSender<ForwardMessage>, (With<Client>, With<Connected>)>,
     config: Res<ClientConfig>,
 ) {
-    let transport_name = match config.transport {
+    let my_name = match config.transport {
         Transport::Udp => "UDP",
-        Transport::WebTransport => "WebTransport",
+        Transport::WebTransport => "WT",
+        Transport::WebSocket => "WS",
     };
 
     for mut receiver in direct_receiver.iter_mut() {
         for msg in receiver.receive() {
-            info!("📥 {} CLIENT <- SERVER (direct): {}", transport_name, msg.content);
+            info!("📥 {} received: {}", my_name, msg.content);
         }
     }
 
     for mut receiver in broadcast_receiver.iter_mut() {
         for msg in receiver.receive() {
-            info!("📥 {} CLIENT <- SERVER (broadcast): {}", transport_name, msg.content);
+            info!("📢 {} received broadcast: {}", my_name, msg.content);
+        }
+    }
+
+    // Handle forwarded messages and send replies (only to non-replies)
+    for mut receiver in forwarded_receiver.iter_mut() {
+        for msg in receiver.receive() {
+            if msg.is_reply {
+                info!("↩️  {} got reply from {}: {}", my_name, msg.from_name, msg.content);
+            } else {
+                info!("📨 {} received from {}: {}", my_name, msg.from_name, msg.content);
+                
+                // Send a reply back to the sender
+                info!("↩️  {} replying to {}", my_name, msg.from_name);
+                for mut sender in forward_sender.iter_mut() {
+                    sender.send::<DefaultChannel>(ForwardMessage {
+                        from_name: my_name.to_string(),
+                        target_name: msg.from_name.clone(),
+                        content: format!("Reply from {} - got your message!", my_name),
+                        is_reply: true,
+                    });
+                }
+            }
         }
     }
 }

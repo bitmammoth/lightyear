@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 bevy = { workspace = true }
-lightyear = { path = "../../lightyear", features = ["server", "client", "udp", "webtransport", "netcode"] }
+lightyear = { path = "../../lightyear", features = ["server", "client", "udp", "webtransport", "websocket", "netcode"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 

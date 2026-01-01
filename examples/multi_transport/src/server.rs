@@ -1,17 +1,19 @@
 //! Server module - demonstrates entity replication with multiple transports.
 //!
-//! This server runs both UDP and WebTransport, allowing clients to connect
-//! via either transport and see replicated player entities.
+//! This server runs UDP, WebTransport, and WebSocket transports, allowing clients
+//! to connect via any transport and see replicated player entities.
 //!
 //! Architecture:
 //! - ONE Server entity (the logical server, relationship target for all LinkOfs)
 //! - UDP transport entity with TransportOf pointing to Server
 //! - WebTransport transport entity with TransportOf pointing to Server
+//! - WebSocket transport entity with TransportOf pointing to Server
 //! - All client LinkOfs point to the ONE Server entity
 //!
 //! Keyboard Commands:
 //! - 1: Send message to UDP client (player 0)
 //! - 2: Send message to WebTransport client (player 1)
+//! - 3: Send message to WebSocket client (player 2)
 //! - B: Broadcast message to ALL clients
 //! - C: Show connected clients
 
@@ -22,6 +24,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
+use lightyear::link::prelude::ViaTransport;
 
 pub struct ExampleServerPlugin;
 
@@ -58,12 +61,14 @@ impl Default for MessageTestTimer {
     }
 }
 
-/// Track connected players and their entities
+/// Track connected players and their entities by name
 #[derive(Resource, Default)]
 struct PlayerRegistry {
     next_id: u64,
-    /// Maps client link entity -> (player_id, player entity)
-    client_to_player: HashMap<Entity, (PlayerId, Entity)>,
+    /// Maps client link entity -> (player_name, player entity)
+    client_to_player: HashMap<Entity, (String, Entity)>,
+    /// Maps player name -> client link entity (for forwarding by name)
+    name_to_client: HashMap<String, Entity>,
 }
 
 impl PlayerRegistry {
@@ -91,49 +96,61 @@ fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
 /// Uses Target replication mode to replicate to ALL clients across ALL transports
 fn handle_connected(
     trigger: On<Add, Connected>,
-    client_query: Query<(&RemoteId, &LinkOf), With<ClientOf>>,
+    client_query: Query<(&RemoteId, &LinkOf, &ViaTransport), With<ClientOf>>,
+    transport_names: Query<&Name>,
     mut commands: Commands,
     mut registry: ResMut<PlayerRegistry>,
 ) {
-    let Ok((remote_id, link_of)) = client_query.get(trigger.entity) else {
+    let Ok((remote_id, link_of, via_transport)) = client_query.get(trigger.entity) else {
         return;
     };
     let client_id = remote_id.0;
     let server_entity = link_of.server;
     let player_id = registry.next_player_id();
     
-    info!("🎮 Client connected: {:?} via server {:?}", client_id, server_entity);
-    info!("   Assigned player ID: {:?}", player_id);
+    // Determine player name from transport (UDP, WT, WS)
+    let player_name = transport_names.get(via_transport.transport)
+        .map(|n| {
+            let name = n.as_str();
+            if name.contains("Udp") { "UDP".to_string() }
+            else if name.contains("WebTransport") { "WT".to_string() }
+            else if name.contains("WebSocket") { "WS".to_string() }
+            else { format!("Player_{}", player_id.0) }
+        })
+        .unwrap_or_else(|_| format!("Player_{}", player_id.0));
     
-    // Choose a color based on player id
-    let colors = [
-        Color::srgb(1.0, 0.2, 0.2),  // Red
-        Color::srgb(0.2, 0.8, 0.2),  // Green
-        Color::srgb(0.2, 0.4, 1.0),  // Blue
-        Color::srgb(1.0, 0.8, 0.2),  // Yellow
-        Color::srgb(0.8, 0.2, 0.8),  // Purple
-        Color::srgb(0.2, 0.8, 0.8),  // Cyan
-    ];
-    let color = colors[player_id.0 as usize % colors.len()];
+    info!("🎮 Client '{}' connected via server {:?}", player_name, server_entity);
     
-    // Spawn the player entity with replication to ALL clients across ALL transports
-    // Using to_all() for unified world replication across UDP + WebTransport
+    // Choose a color based on transport
+    let color = match player_name.as_str() {
+        "UDP" => Color::srgb(1.0, 0.2, 0.2),   // Red
+        "WT" => Color::srgb(0.2, 0.8, 0.2),    // Green
+        "WS" => Color::srgb(0.2, 0.4, 1.0),    // Blue
+        _ => Color::srgb(0.8, 0.8, 0.8),       // Gray
+    };
+    
+    // Spawn the player entity with replication to ALL clients
     let player_entity = commands
         .spawn((
             Player { id: player_id },
             PlayerPosition(Vec2::new(
-                (player_id.0 as f32 % 5.0) * 100.0 - 200.0,
-                (player_id.0 as f32 / 5.0).floor() * 100.0 - 200.0,
+                match player_name.as_str() {
+                    "UDP" => -100.0,
+                    "WT" => 0.0,
+                    "WS" => 100.0,
+                    _ => 0.0,
+                },
+                0.0,
             )),
             PlayerColor(color),
-            // Replicate to all clients across all transports (unified world)
             Replicate::to_all(NetworkTarget::All),
-            Name::new(format!("Player_{}", player_id.0)),
+            Name::new(player_name.clone()),
         ))
         .id();
     
-    registry.client_to_player.insert(trigger.entity, (player_id, player_entity));
-    info!("   Spawned player entity {:?}", player_entity);
+    registry.client_to_player.insert(trigger.entity, (player_name.clone(), player_entity));
+    registry.name_to_client.insert(player_name.clone(), trigger.entity);
+    info!("   Spawned player '{}' entity {:?}", player_name, player_entity);
 }
 
 /// Handle client disconnections
@@ -143,11 +160,11 @@ fn handle_client_disconnected(
     mut registry: ResMut<PlayerRegistry>,
 ) {
     let entity = trigger.entity;
-    info!("👋 Client disconnected: {:?}", entity);
     
     // Remove player entity if it exists
-    if let Some((player_id, player_entity)) = registry.client_to_player.remove(&entity) {
-        info!("   Despawning player {:?}", player_id);
+    if let Some((player_name, player_entity)) = registry.client_to_player.remove(&entity) {
+        info!("👋 Client '{}' disconnected", player_name);
+        registry.name_to_client.remove(&player_name);
         commands.entity(player_entity).despawn();
     }
 }
@@ -202,7 +219,29 @@ fn startup(mut commands: Commands) -> Result {
     commands.trigger(Start { entity: wt_transport });
     info!("🌐 WebTransport transport starting on port {} -> Server {:?}", WEBTRANSPORT_PORT, server);
 
-    info!("\n✅ Server initialized with 2 transports. All clients connect to Server {:?}\n", server);
+    // 4. WebSocket - third transport, also feeds connections to the SAME server
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBSOCKET_PORT);
+    let sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(sans).unwrap());
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),  // Same server!
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("🔌 WebSocket transport starting on port {} -> Server {:?}", WEBSOCKET_PORT, server);
+
+    info!("\n✅ Server initialized with 3 transports. All clients connect to Server {:?}\n", server);
     Ok(())
 }
 
@@ -251,30 +290,30 @@ fn auto_send_messages(
     
     match timer.phase {
         0 => {
-            // Send to UDP client (Player 0)
-            if let Some((&link_entity, &(player_id, _))) = registry.client_to_player.iter().find(|(_, (pid, _))| pid.0 == 0) {
-                info!("📤 SERVER -> UDP Client (Player {}): Sending targeted message", player_id.0);
+            // Send to UDP client
+            if let Some(&link_entity) = registry.name_to_client.get("UDP") {
+                info!("📤 SERVER -> UDP: Sending targeted message");
                 if let Ok((_, mut sender)) = client_sender_query.get_mut(link_entity) {
                     sender.send::<DefaultChannel>(ServerToClientMessage {
-                        content: format!("Hello UDP client! (Player {})", player_id.0),
+                        content: format!("Hello from server!"),
                     });
                 }
             }
         }
         1 => {
-            // Send to WebTransport client (Player 1)
-            if let Some((&link_entity, &(player_id, _))) = registry.client_to_player.iter().find(|(_, (pid, _))| pid.0 == 1) {
-                info!("📤 SERVER -> WebTransport Client (Player {}): Sending targeted message", player_id.0);
+            // Send to WebTransport client
+            if let Some(&link_entity) = registry.name_to_client.get("WT") {
+                info!("📤 SERVER -> WT: Sending targeted message");
                 if let Ok((_, mut sender)) = client_sender_query.get_mut(link_entity) {
                     sender.send::<DefaultChannel>(ServerToClientMessage {
-                        content: format!("Hello WebTransport client! (Player {})", player_id.0),
+                        content: format!("Hello from server!"),
                     });
                 }
             }
         }
         2 => {
             // Broadcast to ALL clients
-            let client_count = registry.client_to_player.len();
+            let client_count = registry.name_to_client.len();
             info!("📢 SERVER -> ALL ({} clients): Broadcasting message", client_count);
             for mut sender in broadcast_sender_query.iter_mut() {
                 sender.send::<DefaultChannel>(BroadcastMessage {
@@ -291,41 +330,39 @@ fn receive_client_messages(
     mut client_msg_query: Query<(Entity, &mut MessageReceiver<ClientToServerMessage>), With<ClientOf>>,
     mut forward_query: Query<(Entity, &mut MessageReceiver<ForwardMessage>), With<ClientOf>>,
     registry: Res<PlayerRegistry>,
-    mut sender_query: Query<&mut MessageSender<ServerToClientMessage>, With<ClientOf>>,
+    mut sender_query: Query<&mut MessageSender<ForwardedMessage>, With<ClientOf>>,
 ) {
     // Handle regular client messages
     for (entity, mut receiver) in client_msg_query.iter_mut() {
         for msg in receiver.receive() {
-            let from_player = registry.client_to_player.get(&entity)
-                .map(|(pid, _)| pid.0)
-                .unwrap_or(999);
-            info!("📥 SERVER <- Client (Player {}): {}", from_player, msg.content);
+            let from_name = registry.client_to_player.get(&entity)
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("Unknown");
+            info!("📥 SERVER <- {}: {}", from_name, msg.content);
         }
     }
 
-    // Handle forward requests
-    for (entity, mut receiver) in forward_query.iter_mut() {
+    // Handle forward requests (by target name)
+    for (_entity, mut receiver) in forward_query.iter_mut() {
         for msg in receiver.receive() {
-            let from_player = registry.client_to_player.get(&entity)
-                .map(|(pid, _)| pid.0)
-                .unwrap_or(999);
-            let target_player_id = msg.target_player_id;
+            let from_name = &msg.from_name;
+            let target_name = &msg.target_name;
+            let msg_type = if msg.is_reply { "reply" } else { "message" };
             
-            info!("🔀 SERVER: Forwarding from Player {} to Player {}: {}", 
-                  from_player, target_player_id, msg.content);
+            info!("🔀 SERVER: {} -> {} ({}): {}", from_name, target_name, msg_type, msg.content);
             
-            // Find target client
-            if let Some((&target_link, _)) = registry.client_to_player.iter()
-                .find(|(_, (pid, _))| pid.0 == target_player_id) 
-            {
+            // Find target client by name
+            if let Some(&target_link) = registry.name_to_client.get(target_name) {
                 if let Ok(mut sender) = sender_query.get_mut(target_link) {
-                    sender.send::<DefaultChannel>(ServerToClientMessage {
-                        content: format!("[Forwarded from Player {}]: {}", from_player, msg.content),
+                    sender.send::<DefaultChannel>(ForwardedMessage {
+                        from_name: from_name.clone(),
+                        content: msg.content.clone(),
+                        is_reply: msg.is_reply,
                     });
-                    info!("   ✅ Forwarded to Player {}", target_player_id);
+                    info!("   ✅ Delivered to {}", target_name);
                 }
             } else {
-                info!("   ⚠️ Target Player {} not found", target_player_id);
+                info!("   ⚠️ Target '{}' not found", target_name);
             }
         }
     }

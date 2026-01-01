@@ -1,13 +1,13 @@
 //! Multi-Transport Entity Replication Example
 //!
 //! Demonstrates:
-//! - Server running both UDP and WebTransport transports
+//! - Server running UDP, WebTransport, and WebSocket transports
 //! - Server spawning player entities when clients connect
 //! - Entity replication to all connected clients
-//! - Clients can connect via either transport
+//! - Clients can connect via any transport
 //!
 //! Usage:
-//!   # Start the server (runs both UDP:5000 and WebTransport:5001)
+//!   # Start the server (runs UDP:5000, WebTransport:5001, WebSocket:5002)
 //!   cargo run -p multi_transport_example -- server
 //!
 //!   # Connect via UDP (in another terminal)
@@ -15,6 +15,9 @@
 //!
 //!   # Connect via WebTransport (copy cert digest from server output)
 //!   cargo run -p multi_transport_example -- client --transport webtransport --cert <DIGEST>
+//!
+//!   # Connect via WebSocket
+//!   cargo run -p multi_transport_example -- client --transport websocket
 
 use bevy::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -36,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as server (UDP + WebTransport)
+    /// Run as server (UDP + WebTransport + WebSocket)
     Server,
     /// Run as client
     Client {
@@ -53,6 +56,7 @@ enum Commands {
 enum TransportArg {
     Udp,
     Webtransport,
+    Websocket,
 }
 
 fn main() {
@@ -89,6 +93,7 @@ fn run_client(transport: TransportArg, cert: Option<String>) {
     let transport_enum = match transport {
         TransportArg::Udp => client::Transport::Udp,
         TransportArg::Webtransport => client::Transport::WebTransport,
+        TransportArg::Websocket => client::Transport::WebSocket,
     };
     
     App::new()
