@@ -1,0 +1,55 @@
+[package]
+name = "multi_transport_fps"
+version = "0.25.5"
+edition = "2021"
+publish = false
+
+[features]
+default = ["gui"]
+gui = [
+  "bevy/bevy_gizmos",
+  "bevy/bevy_sprite",
+  "bevy/bevy_sprite_render",
+  "bevy/bevy_render",
+  "bevy/bevy_core_pipeline",
+  "bevy/bevy_winit",
+  "bevy/bevy_window",
+  "bevy/bevy_text",
+  "bevy/bevy_ui",
+  "bevy/default_font",
+  "bevy/x11",
+]
+
+[dependencies]
+avian2d = { workspace = true, features = [
+  "2d",
+  "debug-plugin",
+  "f32",
+  "parry-f32",
+  "parallel",
+  "serialize",
+] }
+lightyear = { workspace = true, features = [
+  "client",
+  "server",
+  "netcode",
+  "udp",
+  "webtransport",
+  "websocket",
+  "std",
+  "interpolation",
+  "prediction",
+  "replication",
+  "avian2d",
+  "leafwing",
+] }
+lightyear_frame_interpolation.workspace = true
+lightyear_avian2d = { workspace = true, features = ["2d", "lag_compensation"] }
+
+leafwing-input-manager.workspace = true
+serde.workspace = true
+bevy.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

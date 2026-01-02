@@ -36,6 +36,7 @@ members = [
   "benches/*",
   "demos/*",
   "examples/*",
+  "multi_transport_examples/*",
 ]
 default-members = ["lightyear"]
 exclude = []

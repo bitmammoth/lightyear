@@ -2,7 +2,17 @@
 
 ## Summary
 
-This PR implements a **FishNet/Mirror-style multi-transport architecture** where there is ONE logical `Server` entity and multiple transport entities that feed connections to it via `TransportOf`.
+This implements a **FishNet/Mirror-style multi-transport architecture** where there is ONE logical `Server` entity and multiple transport entities that feed connections to it via `TransportOf`. It also adds a `ServerRole` resource to track server state across transports, and the current code treats `LocalTimeline` as a resource (one per app) instead of duplicating it per link.
+
+## Scope and Topologies
+
+Supported today:
+- Client/Server (dedicated server)
+- HostServer/HostClient (client and server in one app)
+
+Not implemented yet:
+- P2P meshes
+- Relay-style P2P (client-server-like relay that forwards only)
 
 ## FishNet → Lightyear Architecture Mapping
 
@@ -78,6 +88,20 @@ Server (WtServerIo) ─────── LinkOf (client)
    └─────────────┘     └─────────────┘     └─────────────┘
 \`\`\`
 
+Note: `ServerRole` is a separate resource used to reflect overall server state (Running/Stopped/etc.). It does not replace the `Server` entity; it aggregates state across transports.
+
+## Addressing the Original SERVER_ROLE Notes
+
+From the original SERVER_ROLE notes (topologies, roles, and timelines), the current code addresses:
+
+1. **Multiple Server entities for one logical server**: fixed. We now have one logical `Server` entity and multiple transport entities that point to it via `TransportOf`. `LinkOf` entities point to that single Server.
+2. **LocalTimeline duplication**: fixed. `LocalTimeline` is a resource (`lightyear_core/src/timeline.rs`), not a per-link component.
+3. **HostClient/HostServer behavior**: addressed. Host clients skip remote timeline sync and get `IsSynced` immediately; the server-side uses `HostServer` markers to handle the combined mode.
+
+Still open:
+- **Driving timeline across multiple remotes (P2P)**: not implemented. The driving timeline (`InputTimeline`) is still a per-client component and the sync logic assumes a single driving timeline (uses `query.single()`), so P2P averaging or multi-remote driving is not supported yet.
+- **Relay or general P2P topologies**: not implemented.
+
 ## Implementation Details
 
 ### 1. `TransportOf` Component (lightyear_link/src/server.rs)
@@ -114,7 +138,18 @@ impl ViaTransport {
 }
 \`\`\`
 
-### 3. Transport Entities (example: UDP)
+### 3. `ServerRole` Resource (lightyear_connection/src/server_role.rs)
+
+Tracks logical server state across transports so run conditions like `is_server` and `is_headless_server` remain correct even with multiple transports:
+
+\`\`\`rust
+#[derive(Resource, Debug, Default, Reflect)]
+pub struct ServerRole {
+    pub state: ServerRoleState,
+}
+\`\`\`
+
+### 4. Transport Entities (example: UDP)
 
 \`\`\`rust
 // ServerUdpIo NO LONGER has #[require(Server)]
@@ -135,7 +170,7 @@ fn receive(transport_entity: Entity, transport_of: &TransportOf, ...) {
 }
 \`\`\`
 
-### 4. Protocol Layer Filtering (lightyear_netcode/src/server_plugin.rs)
+### 5. Protocol Layer Filtering (lightyear_netcode/src/server_plugin.rs)
 
 The netcode server plugin filters clients by `ViaTransport` to only process clients that came through the same transport:
 
@@ -159,7 +194,7 @@ fn send(
 }
 \`\`\`
 
-### 3. Spawning Multi-Transport Server
+### 6. Spawning Multi-Transport Server
 
 \`\`\`rust
 // Spawn ONE Server entity
@@ -190,11 +225,12 @@ commands.spawn((
 ### Core
 - `lightyear_link/src/server.rs` - Added `TransportOf` and `ViaTransport` components
 - `lightyear_netcode/src/server_plugin.rs` - Updated queries to use `TransportOf` lookup and `ViaTransport` filtering
+- `lightyear_connection/src/server_role.rs` - Added `ServerRole` resource to track server state across transports
 
 ### Transports (removed `#[require(Server)]`, use `TransportOf` and add `ViaTransport` to new clients)
 - `lightyear_udp/src/server.rs` - Added `UdpLinkOfIO` marker, spawns with `ViaTransport`
 - `lightyear_webtransport/src/server.rs` - Added `WebTransportLinkOfIO` marker, spawns with `ViaTransport`
-- `lightyear_websocket/src/server.rs` - Added `WebSocketLinkOfIO` marker
+- `lightyear_websocket/src/server.rs` - Added `WebSocketLinkOfIO` marker, spawns with `ViaTransport`
 - `lightyear_steam/src/server.rs` - Uses existing `SteamClientOf` marker
 
 ### Examples
@@ -222,11 +258,12 @@ commands.spawn((ServerUdpIo::default(), TransportOf::new(server), LocalAddr(addr
 2. **Clean queries** - Query all clients: `Query<&LinkOf>`, query by transport: `Query<&LinkOf, With<UdpLinkOfIO>>`
 3. **Natural ECS pattern** - No need for FishNet's `Multipass` ID remapping; Bevy relationships handle it
 4. **Single source of truth** - One `Server` entity holds all game state, timelines, etc.
+5. **Server state is centralized** - `ServerRole` aggregates transport state for run conditions and server role checks
 
 ## Next Steps / TODO
 
 - [x] Full integration test with multi_transport example - **WORKING!**
 - [ ] Update book documentation
-- [ ] Consider adding `ServerRole` resource for server state (Running/Stopped/etc.)
+- [x] Add `ServerRole` resource for server state (Running/Stopped/etc.)
 - [ ] Consider transport priority/preferences for replication
-- [ ] Add `ViaTransport` to WebSocket transport
+- [x] Add `ViaTransport` to WebSocket transport

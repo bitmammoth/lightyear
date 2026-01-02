@@ -1,0 +1,58 @@
+[package]
+name = "multi_transport_deterministic_replication"
+version = "0.25.5"
+rust-version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = ["server", "client"]
+server = ["lightyear/server"]
+client = ["lightyear/client"]
+
+[dependencies]
+bevy = { workspace = true, features = [
+    "bevy_gizmos",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
+    "png",
+    "x11",
+] }
+lightyear = { path = "../../lightyear", features = [
+    "std",
+    "server",
+    "client",
+    "netcode",
+    "udp",
+    "webtransport",
+    "websocket",
+    "interpolation",
+    "prediction",
+    "replication",
+    "leafwing",
+    "avian2d",
+    "deterministic",
+    "debug",
+] }
+lightyear_avian2d = { path = "../../lightyear_avian2d", features = ["2d", "deterministic"] }
+avian2d = { workspace = true, features = [
+    "2d",
+    "f32",
+    "parry-f32",
+    "serialize",
+    "enhanced-determinism",
+] }
+leafwing-input-manager.workspace = true
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+rand.workspace = true
+
+[lints]
+workspace = true
