@@ -1,254 +1,115 @@
-extern crate alloc;
-use alloc::collections::VecDeque;
-use bevy::app::{App, Plugin};
+//! Protocol definitions for replication groups example.
+
 use bevy::ecs::entity::MapEntities;
 use bevy::math::Curve;
 use bevy::prelude::*;
-use core::ops::{Add, Mul};
-use lightyear::input::native::plugin::InputPlugin;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::trace;
 
-// Components
+// ============ Components ============
 
+/// Unique identifier for each player
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerId(pub PeerId);
+pub struct PlayerId(pub u64);
 
-#[derive(
-    Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Deref, DerefMut, Reflect,
-)]
-pub struct PlayerPosition(pub(crate) Vec2);
+/// Player head position
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Deref, DerefMut, Reflect)]
+pub struct PlayerPosition(pub Vec2);
 
 impl Ease for PlayerPosition {
     fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
             PlayerPosition(Vec2::lerp(start.0, end.0, t))
         })
     }
 }
 
-impl Add for PlayerPosition {
-    type Output = PlayerPosition;
-    #[inline]
-    fn add(self, rhs: PlayerPosition) -> PlayerPosition {
-        PlayerPosition(self.0.add(rhs.0))
-    }
-}
+/// Player color
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerColor(pub Color);
 
-impl Mul<f32> for &PlayerPosition {
-    type Output = PlayerPosition;
+/// Trail color - usually same as player but with different alpha
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct TrailColor(pub Color);
 
-    fn mul(self, rhs: f32) -> Self::Output {
-        PlayerPosition(self.0 * rhs)
-    }
-}
-
-impl PlayerPosition {
-    /// Checks if the position is between two other positions.
-    /// (the positions must have the same x or y)
-    /// Will return None if it's not in between, otherwise will return where it is between a and b
-    pub(crate) fn is_between(&self, a: Vec2, b: Vec2) -> Option<f32> {
-        if a.x == b.x {
-            if self.x != a.x {
-                return None;
-            }
-            if a.y < b.y {
-                if a.y <= self.y && self.y <= b.y {
-                    return Some((self.y - a.y) / (b.y - a.y));
-                } else {
-                    return None;
-                }
-            } else {
-                if b.y <= self.y && self.y <= a.y {
-                    return Some((a.y - self.y) / (a.y - b.y));
-                } else {
-                    return None;
-                }
-            }
-        } else if a.y == b.y {
-            if self.y != a.y {
-                return None;
-            }
-            if a.x < b.x {
-                if a.x <= self.x && self.x <= b.x {
-                    return Some((self.x - a.x) / (b.x - a.x));
-                } else {
-                    return None;
-                }
-            } else {
-                if b.x <= self.x && self.x <= a.x {
-                    return Some((a.x - self.x) / (a.x - b.x));
-                } else {
-                    return None;
-                }
-            }
-        }
-        unreachable!("a ({}) and b ({}) should be on the same x or y", a, b)
-    }
-}
-
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerColor(pub(crate) Color);
-
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-pub struct TailLength(pub(crate) f32);
-
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-// tail inflection points, from front (point closest to the head) to back (tail end point)
-pub struct TailPoints(pub(crate) VecDeque<(Vec2, Direction)>);
-
-pub fn segment_length(from: Vec2, to: Vec2) -> f32 {
-    (from - to).length()
-}
-impl TailPoints {
-    /// Make sure that the tail is exactly `length` long
-    pub(crate) fn shorten_back(&mut self, head: Vec2, length: f32) {
-        // find the index of the first point to modify (all points after that needs to be discarded)
-
-        // treat the first point separately
-        let mut current_length = segment_length(head, self.0.front().unwrap().0);
-        if current_length >= length {
-            trace!("shortening first segment");
-            let direction = self.0.front().unwrap().1;
-            let new_point = direction.get_tail(head, length);
-            self.0 = VecDeque::new();
-            self.0.push_front((new_point, direction));
-            return;
-        }
-        for i in 1..self.0.len() {
-            let segment_length = segment_length(self.0[i - 1].0, self.0[i].0);
-            current_length += segment_length;
-            if current_length > length {
-                trace!("shortening tail");
-                let direction = self.0[i].1;
-                let new_segment_length = segment_length - (current_length - length);
-
-                // shorten the segment, and drop the rest
-                if new_segment_length > 0.0 {
-                    let new_point = direction
-                        .get_tail(self.0[i - 1].0, segment_length - (current_length - length));
-                    // drop all elements from [i, ..[
-                    let _ = self.0.split_off(i);
-                    self.0.push_back((new_point, direction));
-                } else {
-                    // drop all elements from [i, ..[
-                    let _ = self.0.split_off(i);
-                }
-                trace!("new tail: {:?}", self.0);
-                return;
-            }
-        }
-    }
-}
-
-// Example of a component that contains an entity.
-// This component, when replicated, needs to have the inner entity mapped from the Server world
-// to the client World.
-// This can be done by calling `app.add_component_map_entities::<PlayerParent>()` in your protocol,
-// and deriving the `MapEntities` trait for the component.
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerParent(#[entities] pub(crate) Entity);
+/// Reference to the parent player entity - demonstrates entity references in replication
+/// The #[entities] attribute marks this for entity mapping during replication
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerParent(#[entities] pub Entity);
 
 impl MapEntities for PlayerParent {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, entity_mapper: &mut M) {
         self.0 = entity_mapper.get_mapped(self.0);
     }
 }
 
-// Inputs
+/// Trail position - linked to a player head
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
+pub struct TrailPosition(pub Vec2);
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Reflect)]
-// To simplify, we only allow one direction at a time
-pub enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
+impl Ease for TrailPosition {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
+            TrailPosition(Vec2::lerp(start.0, end.0, t))
+        })
+    }
 }
 
-impl MapEntities for Direction {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+// ============ Inputs ============
+
+/// Direction input
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
+pub struct Direction {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
 }
 
 impl Direction {
-    // Get the direction from `from` to `to` (doesn't handle diagonals)
-    pub fn from_points(from: Vec2, to: Vec2) -> Option<Self> {
-        if from.x != to.x && from.y != to.y {
-            trace!(?from, ?to, "diagonal");
-            return None;
-        }
-        if from.y < to.y {
-            return Some(Self::Up);
-        }
-        if from.y > to.y {
-            return Some(Self::Down);
-        }
-        if from.x > to.x {
-            return Some(Self::Left);
-        }
-        if from.x < to.x {
-            return Some(Self::Right);
-        }
-        None
-    }
-
-    // Get the position of the point that would become `head` if we applied `length` * `self`
-    pub fn get_tail(&self, head: Vec2, length: f32) -> Vec2 {
-        match self {
-            Direction::Up => Vec2::new(head.x, head.y - length),
-            Direction::Down => Vec2::new(head.x, head.y + length),
-            Direction::Left => Vec2::new(head.x + length, head.y),
-            Direction::Right => Vec2::new(head.x - length, head.y),
-        }
+    #[allow(dead_code)]
+    pub fn is_none(&self) -> bool {
+        !self.up && !self.down && !self.left && !self.right
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Reflect)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect, Default)]
 pub enum Inputs {
-    Direction(Direction),
-    Delete,
-    Spawn,
     #[default]
-    Empty,
+    None,
+    Direction(Direction),
 }
 
 impl MapEntities for Inputs {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, _entity_mapper: &mut M) {}
 }
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// ============ Protocol Plugin ============
+
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
-        app.add_plugins(InputPlugin::<Inputs>::default());
-        // components
-        app.register_component::<Name>();
+        // Register inputs
+        app.add_plugins(lightyear::prelude::input::native::InputPlugin::<Inputs>::default());
+        
+        // Register components
         app.register_component::<PlayerId>();
-
+        app.register_component::<PlayerColor>();
+        app.register_component::<TrailColor>();
+        
+        // PlayerPosition with prediction and interpolation
         app.register_component::<PlayerPosition>()
             .add_prediction()
-            // NOTE: notice that we use custom interpolation here, this means that we don't run
-            //  the interpolation function for this component, so we need to implement our own interpolation system
-            //  (we do this because our interpolation system queries multiple components at once)
-            .add_custom_interpolation()
-            // we still register an interpolation function which will be used for frame interpolation
             .add_linear_interpolation();
-
-        app.register_component::<PlayerColor>();
-
-        app.register_component::<TailPoints>()
+        
+        // TrailPosition with prediction and interpolation
+        app.register_component::<TrailPosition>()
             .add_prediction()
-            // NOTE: notice that we use custom interpolation here, this means that we don't run
-            //  the interpolation function for this component, so we need to implement our own interpolation system
-            //  (we do this because our interpolation system queries multiple components at once)
-            .add_custom_interpolation();
-        // we do not register an interpolation function because we will use a custom interpolation system
-
-        app.register_component::<TailLength>();
-
-        app.register_component::<PlayerParent>().add_map_entities();
+            .add_linear_interpolation();
+        
+        // PlayerParent with entity mapping (critical for replication groups!)
+        app.register_component::<PlayerParent>()
+            .add_map_entities();
     }
 }

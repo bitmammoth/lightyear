@@ -1,32 +1,169 @@
-# Simple box
+# Multi-Transport Example
 
-A simple example that shows how to use Lightyear to create a server-authoritative multiplayer game.
+This comprehensive example demonstrates lightyear's **multi-transport architecture**, enabling a single server to accept connections from clients using different network transports simultaneously.
 
-It also showcases how to enable client-side prediction and snapshot interpolation:
-- For the client sending inputs: the pink cube is client-predicted (so inputs are used with no delay, and there is a rollback in case of mismatch with the server) and the red cube shows the received server state. (the server state arrives with some delay, and is a bit choppy since the replication rate is only 10Hz).
-- For the other clients: the red cube still shows the server states arriving at 10Hz, and the pink cube is a smooth interpolation between those states (there is a slight delay because we can only interpolate between 2 received server states).
+## Features Demonstrated
 
-https://github.com/cBournhonesque/lightyear/assets/8112632/7b57d48a-d8b0-4cdd-a16f-f991a394c852
+### Core Multi-Transport
+- **Single logical server** accepting connections via UDP, WebTransport, and WebSocket
+- **Transport decoupling** using `TransportOf` relationship (transports are separate entities from the Server)
+- **Unified game state** - all clients see the same world regardless of transport
 
-## Running an example
+### Replication & Prediction
+- **Server-authoritative spawning** - players spawned when clients connect
+- **Client prediction** - immediate local response to inputs
+- **Server reconciliation** - corrections from authoritative server
+- **Entity interpolation** - smooth rendering of other players
 
-- Run the server with a gui: `cargo run -- server`
-- Run client with id 1: `cargo run -- client -c 1`
+### Input System
+- **Native inputs** - keyboard input capture with Direction enum
+- **Input buffering** - reliable input transmission to server
+- **Shared movement** - same movement logic on client and server
 
-[//]: # (- Run the client and server in two separate bevy Apps: `cargo run` or `cargo run separate`)
-- Run the server without a gui: `cargo run --no-default-features --features=server -- server`
-- Run the client and server in "HostClient" mode, where the client also acts as server (both are in the same App) : `cargo run -- host-client -c 0`
+### Messaging
+- **Bidirectional messages** - client-to-client messaging via server relay
+- **Named entities** - players identified by transport name (UDP, WS, WT)
 
-You can control the behaviour of the example by changing the list of features. By default, all features are enabled (client, server, gui).
-For example you can run the server in headless mode (without gui) by running `cargo run --no-default-features --features=server,udp,netcode`.
+## Architecture
 
-### Testing in wasm with webtransport
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Server Entity (logical)                   │
+│  - Server component                                          │
+│  - LocalTimeline                                             │
+│  - Started                                                   │
+└─────────────────────────────────────────────────────────────┘
+         ▲                    ▲                    ▲
+         │ TransportOf        │ TransportOf        │ TransportOf
+         │                    │                    │
+┌────────┴────────┐  ┌────────┴────────┐  ┌────────┴────────┐
+│  UDP Transport  │  │  WT Transport   │  │  WS Transport   │
+│  :5000          │  │  :5001          │  │  :5002          │
+│  NetcodeServer  │  │  NetcodeServer  │  │  NetcodeServer  │
+│  Started        │  │  Started        │  │  Started        │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+```
 
-NOTE: I am using the [bevy cli](https://github.com/TheBevyFlock/bevy_cli) to build and serve the wasm example.
+## Running the Example
 
-To test the example in wasm, you can run the following commands: `bevy run web`
+### Start Server
+```bash
+cargo run -p simple_box -- server
+```
 
-You will need a valid SSL certificate to test the example in wasm using webtransport. You will need to run the following
-commands to generate a self-signed certificate:
-- `cd "$(git rev-parse --show-toplevel)" && sh certificates/generate.sh` (to generate the temporary SSL
-  certificates, they are only valid for 2 weeks)
+The server starts all three transports:
+- UDP on port 5000
+- WebTransport on port 5001 (prints certificate digest)
+- WebSocket on port 5002
+
+### Connect Clients
+
+**UDP Client:**
+```bash
+cargo run -p simple_box -- client --transport udp
+# or short form
+cargo run -p simple_box -- client -t udp
+```
+
+**WebSocket Client:**
+```bash
+cargo run -p simple_box -- client --transport websocket
+# or short form
+cargo run -p simple_box -- client -t ws
+```
+
+**WebTransport Client:**
+```bash
+# Copy the certificate digest from server output, then:
+cargo run -p simple_box -- client --transport webtransport --cert <DIGEST>
+# or short form
+cargo run -p simple_box -- client -t wt -c <DIGEST>
+```
+
+## Controls
+
+- **Arrow Keys / WASD**: Move player
+- Players are rendered as colored boxes using gizmos
+
+## Code Structure
+
+```
+src/
+├── main.rs      # CLI and app setup
+├── shared.rs    # Protocol, components, input types
+├── server.rs    # Multi-transport server setup, player spawning, movement
+├── client.rs    # Client connection, prediction, input handling
+└── renderer.rs  # Camera and gizmo rendering
+```
+
+## Key Implementation Details
+
+### Transport Setup (server.rs)
+```rust
+// 1. Spawn logical Server entity
+let server = commands.spawn((Server::default(), Name::new("GameServer"))).id();
+
+// 2. Spawn transport entities with TransportOf relationship
+commands.spawn((
+    NetcodeServer::new(NetcodeConfig::default()),
+    LocalAddr(udp_addr),
+    ServerUdpIo::default(),
+    TransportOf::new(server),  // Links to logical server
+    Name::new("UdpTransport"),
+));
+```
+
+### Player Spawning (server.rs)
+```rust
+fn handle_connected(trigger: On<Add, Connected>, mut commands: Commands) {
+    let client_entity = trigger.entity;
+    
+    commands.spawn((
+        PlayerId(client_id),
+        PlayerPosition::default(),
+        ActionState::<Inputs>::default(),
+        // Replication targets
+        PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+        InterpolationTarget::default(),
+        Replicating::to_clients(NetworkTarget::All),
+        Name::new(client_name),
+    ));
+}
+```
+
+### Input Handling (client.rs)
+```rust
+fn buffer_input(
+    tick: Res<LocalTimeline>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut query: Query<&mut InputBuffer<ActionState<Inputs>, Inputs>, With<InputMarker>>,
+) {
+    let direction = Direction {
+        up: keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp),
+        down: keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown),
+        left: keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft),
+        right: keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight),
+    };
+    
+    for mut buffer in query.iter_mut() {
+        buffer.set(tick.tick(), &ActionState(Inputs::Direction(direction)));
+    }
+}
+```
+
+## Testing Scenarios
+
+1. **Single UDP client**: Basic connectivity test
+2. **Single WebSocket client**: Web-compatible transport test
+3. **Single WebTransport client**: Modern web transport test
+4. **Multiple clients same transport**: Test client isolation
+5. **Multiple clients different transports**: Test unified game state
+6. **Client disconnect/reconnect**: Test cleanup and rejoin
+
+## Related Changes to Lightyear Core
+
+This example requires the following changes to lightyear (included in this fork):
+
+1. **`lightyear_inputs/src/server.rs`**: Changed `With<Started>` to `With<Server>` in `update_action_state` query to support multi-transport
+2. **`lightyear_link/src/server.rs`**: Added `TransportOf` relationship for decoupled transports
+3. **`lightyear_connection/src/server_role.rs`**: Added `ServerRole` resource for transport state tracking

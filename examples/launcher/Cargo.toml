@@ -12,8 +12,13 @@ bevy = { workspace = true, default-features = false, features = [
   "bevy_render",
   "bevy_core_pipeline",
   "bevy_pbr",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_gizmos",
   "x11",
   "wayland",
+  "default_font",
 ] }
 bevy_egui = { workspace = true }
 lightyear = { path = "../../lightyear", features = [
@@ -21,22 +26,17 @@ lightyear = { path = "../../lightyear", features = [
   "server",
   "prediction",
   "interpolation",
+  "replication",
   "input_native",
 ] }
-lightyear_examples_common = { path = "../common", features = [
-  "client",
-  "server",
-  "gui",
-] } # Added common
 
 # utils
 rand.workspace = true
 tracing.workspace = true
 serde.workspace = true
 
-# Add dependencies for specific examples, enabling necessary features
-simple_box = { path = "../simple_box", features = ["client", "server", "gui"] }
-# fps_new = { path = "../fps_new", features = ["client", "server", "gui"] } # Add other examples as needed
+# For multi-transport support
+simple_box = { path = "../simple_box" }
 
 clap = { version = "4.5.3", features = ["derive"] }
 strum = { version = "0.27", features = ["derive"] }

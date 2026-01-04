@@ -1,135 +1,190 @@
-//! The server side of the example.
-//! It is possible (and recommended) to run the server in headless mode (without any rendering plugins).
+//! Server module - multi-transport server with TCP auth backend.
 //!
-//! The server will:
-//! - spawn a new player entity for each client that connects
-//! - read inputs from the clients and move the player entities accordingly
-//!
-//! Lightyear will handle the replication of entities automatically if you add a `Replicate` component to them.
+//! The server:
+//! 1. Starts TCP listener for auth token requests
+//! 2. Generates ConnectTokens for clients
+//! 3. Runs game server on UDP, WebTransport, and WebSocket
+
 extern crate alloc;
 use alloc::sync::Arc;
-use anyhow::Context;
 use async_compat::Compat;
-use core::net::SocketAddr;
 use std::sync::RwLock;
+use std::collections::HashSet;
 
-use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
-use core::time::Duration;
+use core::net::Ipv4Addr;
+use std::net::SocketAddr;
 use lightyear::netcode::ConnectToken;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
-use lightyear_examples_common::shared::{SERVER_ADDR, SERVER_PORT, SHARED_SETTINGS};
+use lightyear::connection::server::Started;
 use tokio::io::AsyncWriteExt;
 
-use crate::shared;
+use crate::shared::*;
 
-pub struct ExampleServerPlugin {
-    pub game_server_addr: SocketAddr,
-    pub auth_backend_addr: SocketAddr,
-}
+pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(handle_disconnect_event);
-        app.add_observer(handle_connect_event);
-
+        app.add_systems(Startup, startup);
+        app.add_observer(handle_new_client);
+        app.add_observer(handle_connected);
+        app.add_observer(handle_disconnected);
+        
+        // Start the auth backend task
         let client_ids = Arc::new(RwLock::new(HashSet::default()));
-        start_netcode_authentication_task(
-            self.game_server_addr,
-            self.auth_backend_addr,
-            client_ids.clone(),
-        );
+        start_auth_backend(client_ids.clone());
         app.insert_resource(ClientIds(client_ids));
     }
 }
 
-/// This resource will track the list of Netcode client-ids currently in use, so that
-/// we don't have multiple clients with the same id
-#[derive(Resource, Default)]
+/// Track connected client IDs to prevent duplicates
+#[derive(Resource)]
 struct ClientIds(Arc<RwLock<HashSet<u64>>>);
 
-/// Update the list of connected client ids when a client disconnects
-fn handle_disconnect_event(
-    trigger: On<Add, Disconnected>,
-    query: Query<&RemoteId, With<ClientOf>>,
-    client_ids: Res<ClientIds>,
-) {
-    let Ok(remote_id) = query.get(trigger.entity) else {
-        return;
-    };
-    if let PeerId::Netcode(client_id) = remote_id.0 {
-        info!(
-            "Client disconnected: {}. Removing from ClientIds.",
-            client_id
-        );
-        client_ids.0.write().unwrap().remove(&client_id);
-    }
+/// Start the server with multiple transports
+fn startup(mut commands: Commands) -> Result {
+    info!("\n=== Multi-Transport Auth Server Starting ===\n");
+    info!("🔐 Auth backend listening on TCP port {}", AUTH_BACKEND_PORT);
+
+    // 1. Spawn ONE logical server
+    let server = commands
+        .spawn((
+            Server::default(),
+            Name::new("GameServer"),
+        ))
+        .id();
+    info!("🎯 Spawned logical Server entity: {:?}", server);
+
+    // 2. UDP Transport
+    let udp_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), UDP_PORT);
+    let udp_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(udp_addr),
+            ServerUdpIo::default(),
+            TransportOf::new(server),
+            Name::new("UdpTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: udp_transport });
+    info!("📡 UDP transport starting on port {}", UDP_PORT);
+
+    // 3. WebTransport
+    let wt_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBTRANSPORT_PORT);
+    let sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let identity = Identity::self_signed(sans).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    info!("🔐 WebTransport certificate digest: {}", digest);
+    
+    let wt_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(wt_addr),
+            WebTransportServerIo { certificate: identity },
+            TransportOf::new(server),
+            Name::new("WebTransportTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: wt_transport });
+    info!("🌐 WebTransport transport starting on port {}", WEBTRANSPORT_PORT);
+
+    // 4. WebSocket
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBSOCKET_PORT);
+    let sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(sans).unwrap());
+    
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("🔌 WebSocket transport starting on port {}", WEBSOCKET_PORT);
+    
+    commands.entity(server).insert(Started);
+
+    info!("\n=== Server Ready ===\n");
+    Ok(())
 }
 
-/// Update the list of connected client ids when a client connects
-fn handle_connect_event(
+/// Add ReplicationSender to new clients
+fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    info!("🔗 New client link created: {:?}", trigger.entity);
+    commands.entity(trigger.entity).insert((
+        ReplicationSender::new(SERVER_REPLICATION_INTERVAL, SendUpdatesMode::SinceLastAck, false),
+        Name::from("Client"),
+    ));
+}
+
+/// Track client connection
+fn handle_connected(
     trigger: On<Add, Connected>,
     query: Query<&RemoteId, With<ClientOf>>,
     client_ids: Res<ClientIds>,
 ) {
-    let Ok(remote_id) = query.get(trigger.entity) else {
-        return;
-    };
+    let Ok(remote_id) = query.get(trigger.entity) else { return };
     if let PeerId::Netcode(client_id) = remote_id.0 {
-        info!("Client connected: {}. Adding to ClientIds.", client_id);
+        info!("✅ Client {} connected (authenticated via token)", client_id);
         client_ids.0.write().unwrap().insert(client_id);
     }
 }
 
-/// Start a detached task that listens for incoming TCP connections and sends `ConnectToken`s to clients
-fn start_netcode_authentication_task(
-    game_server_addr: SocketAddr,
-    auth_backend_addr: SocketAddr,
-    client_ids: Arc<RwLock<HashSet<u64>>>,
+/// Track client disconnection
+fn handle_disconnected(
+    trigger: On<Add, Disconnected>,
+    query: Query<&RemoteId, With<ClientOf>>,
+    client_ids: Res<ClientIds>,
 ) {
+    let Ok(remote_id) = query.get(trigger.entity) else { return };
+    if let PeerId::Netcode(client_id) = remote_id.0 {
+        info!("👋 Client {} disconnected", client_id);
+        client_ids.0.write().unwrap().remove(&client_id);
+    }
+}
+
+/// Start the TCP auth backend that generates ConnectTokens
+fn start_auth_backend(client_ids: Arc<RwLock<HashSet<u64>>>) {
     IoTaskPool::get()
         .spawn(Compat::new(async move {
-            info!(
-                "Listening for ConnectToken requests on {}",
-                auth_backend_addr
-            );
-            let listener = tokio::net::TcpListener::bind(auth_backend_addr)
+            info!("🔐 Starting auth backend on {}", AUTH_BACKEND_ADDR);
+            let listener = tokio::net::TcpListener::bind(AUTH_BACKEND_ADDR)
                 .await
-                .unwrap();
+                .expect("Failed to bind auth backend");
+            
             loop {
-                // received a new connection
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, peer_addr) = listener.accept().await.unwrap();
+                info!("📥 Auth request from {}", peer_addr);
 
-                // assign a new client_id
+                // Generate unique client ID
                 let client_id = loop {
-                    let client_id = rand::random();
-                    if !client_ids.read().unwrap().contains(&client_id) {
-                        break client_id;
+                    let id = rand::random();
+                    if !client_ids.read().unwrap().contains(&id) {
+                        break id;
                     }
                 };
 
+                // Generate ConnectToken for UDP server (client will connect to appropriate transport)
                 let token = ConnectToken::build(
-                    game_server_addr,
-                    SHARED_SETTINGS.protocol_id,
+                    UDP_SERVER_ADDR,
+                    PROTOCOL_ID,
                     client_id,
-                    SHARED_SETTINGS.private_key,
+                    PRIVATE_KEY,
                 )
                 .generate()
                 .expect("Failed to generate token");
 
-                let serialized_token = token.try_into_bytes().expect("Failed to serialize token");
-                trace!(
-                    "Sending token {:?} to client {}. Token len: {}",
-                    serialized_token,
-                    client_id,
-                    serialized_token.len()
-                );
-                stream
-                    .write_all(&serialized_token)
-                    .await
-                    .expect("Failed to send token to client");
+                let serialized = token.try_into_bytes().expect("Failed to serialize token");
+                info!("📤 Sending token for client {} ({} bytes)", client_id, serialized.len());
+                
+                stream.write_all(&serialized).await.expect("Failed to send token");
             }
         }))
         .detach();

@@ -1,40 +1,32 @@
 [package]
 name = "auth"
 version = "0.25.5"
-authors = ["Charles Bournhonesque <charlesbour@gmail.com>"]
 edition = "2021"
-description = "Examples for the lightyearServer-client networking library for the Bevy game engine"
-readme = "README.md"
-repository = "https://github.com/cBournhonesque/lightyear"
-keywords = ["bevy", "multiplayer", "networking", "netcode", "gamedev"]
-categories = ["game-development", "network-programming"]
-license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-lightyear = { "workspace" = true, features = [
-  "netcode",
-  "interpolation",
-  "prediction",
-  "replication",
-  "client",
-  "server",
-  "udp",
-  "std",
+bevy = { workspace = true, features = [
+  "bevy_gizmos",
+  "bevy_sprite",
+  "bevy_sprite_render",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_winit",
+  "bevy_window",
+  "bevy_ui",
+  "bevy_text",
+  "default_font",
+  "png",
+  "x11",
 ] }
-lightyear_examples_common = { "workspace" = true, features = [
-  "client",
-  "server",
-  "gui",
-  "netcode",
-  "udp",
-] }
+lightyear = { path = "../../lightyear", features = ["server", "client", "udp", "webtransport", "websocket", "netcode", "input_native", "debug"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+async-compat = "0.2"
+anyhow = "1.0"
+tokio = { version = "1", features = ["net", "io-util"] }
+rand = "0.8"
 
-async-compat.workspace = true
-anyhow.workspace = true
-bevy.workspace = true
-rand.workspace = true
-tokio = { "workspace" = true, features = ["net", "io-util"] }
-
-[lints]
-workspace = true
+[[bin]]
+name = "auth"
+path = "src/main.rs"

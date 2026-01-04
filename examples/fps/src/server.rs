@@ -1,47 +1,124 @@
+//! Server-side code for the FPS example
+
 use crate::protocol::*;
-use crate::shared;
-use crate::shared::{color_from_id, shared_player_movement, BOT_RADIUS};
+use crate::shared::{color_from_id, BOT_RADIUS};
+use crate::{UDP_PORT, WEBTRANSPORT_PORT, WEBSOCKET_PORT};
 use avian2d::prelude::*;
 use bevy::prelude::*;
-use bevy::time::Stopwatch;
-use core::ops::DerefMut;
 use core::time::Duration;
+use core::net::Ipv4Addr;
 use leafwing_input_manager::prelude::*;
-use lightyear::interpolation::plugin::InterpolationDelay;
+use lightyear::connection::server::Started;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
 use lightyear_avian2d::prelude::{
     LagCompensationHistory, LagCompensationPlugin, LagCompensationSpatialQuery,
     LagCompensationSystems,
 };
-use lightyear_examples_common::shared::SEND_INTERVAL;
+use std::net::SocketAddr;
 
-pub struct ExampleServerPlugin;
-
+const SEND_INTERVAL: Duration = Duration::from_millis(40);
 const BULLET_COLLISION_DISTANCE_CHECK: f32 = 4.0;
 
-impl Plugin for ExampleServerPlugin {
+pub struct ServerPlugin;
+
+impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(LagCompensationPlugin);
-        app.add_systems(Startup, spawn_bots);
+        app.add_systems(Startup, (start_server, spawn_bots));
         app.add_observer(handle_new_client);
         app.add_observer(spawn_player);
-        // the lag compensation systems need to run after LagCompensationSet::UpdateHistory
+        
         app.add_systems(FixedUpdate, interpolated_bot_movement);
         app.add_systems(
             PhysicsSchedule,
-            // lag compensation collisions must run after the SpatialQuery has been updated
             compute_hit_lag_compensation.in_set(LagCompensationSystems::Collisions),
         );
         app.add_systems(
             FixedPostUpdate,
-            // check collisions after physics have run
             compute_hit_prediction.after(PhysicsSystems::StepSimulation),
         );
     }
 }
 
-pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+/// Start the multi-transport server with UDP, WebTransport, and WebSocket
+fn start_server(mut commands: Commands) -> Result {
+    // 1. Spawn the logical Server entity
+    let server = commands
+        .spawn((
+            Server::default(),
+            Name::new("Server"),
+        ))
+        .id();
+    info!("Spawned logical Server entity: {:?}", server);
+    
+    // 2. UDP Transport
+    let udp_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), UDP_PORT);
+    let udp_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(udp_addr),
+            ServerUdpIo::default(),
+            TransportOf::new(server),
+            Name::new("UdpTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: udp_transport });
+    info!("UDP transport starting on port {} -> Server {:?}", UDP_PORT, server);
+
+    // 3. WebTransport
+    let wt_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBTRANSPORT_PORT);
+    let sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let identity = Identity::self_signed(sans).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    info!("WebTransport certificate digest: {}", digest);
+    
+    let wt_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(wt_addr),
+            WebTransportServerIo { certificate: identity },
+            TransportOf::new(server),
+            Name::new("WebTransportTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: wt_transport });
+    info!("WebTransport transport starting on port {} -> Server {:?}", WEBTRANSPORT_PORT, server);
+
+    // 4. WebSocket
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBSOCKET_PORT);
+    let ws_sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(ws_sans).unwrap());
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("WebSocket transport starting on port {} -> Server {:?}", WEBSOCKET_PORT, server);
+
+    // 5. Mark server as Started
+    commands.entity(server).insert(Started);
+    info!("Multi-transport FPS server started!");
+    
+    Ok(())
+}
+
+pub fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
     commands
         .entity(trigger.entity)
         .insert(ReplicationSender::new(
@@ -51,18 +128,10 @@ pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands
         ));
 }
 
-// Replicate the pre-spawned entities back to the client
-// We have to use `InitialReplicated` instead of `Replicated`, because
-// the server has already assumed authority over the entity so the `Replicated` component
-// has been removed
-pub(crate) fn spawn_player(
+pub fn spawn_player(
     trigger: On<Add, Connected>,
     query: Query<&RemoteId, With<ClientOf>>,
     mut commands: Commands,
-    replicated_players: Query<
-        (Entity, &InitialReplicated),
-        (Added<InitialReplicated>, With<PlayerId>),
-    >,
 ) {
     let Ok(client_id) = query.get(trigger.entity) else {
         return;
@@ -70,7 +139,7 @@ pub(crate) fn spawn_player(
     let client_id = client_id.0;
     let y = (client_id.to_bits() as f32 * 50.0) % 500.0 - 250.0;
     let color = color_from_id(client_id);
-    info!("Spawning player with id: {}", client_id);
+    info!("Spawning player with id: {:?}", client_id);
     commands.spawn((
         Replicate::to_clients(NetworkTarget::All),
         PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
@@ -91,18 +160,16 @@ pub(crate) fn spawn_player(
 }
 
 /// Spawn bots (one predicted, one interpolated)
-pub(crate) fn spawn_bots(mut commands: Commands) {
+pub fn spawn_bots(mut commands: Commands) {
     commands.spawn((
         InterpolatedBot,
         Name::new("InterpolatedBot"),
         Replicate::to_clients(NetworkTarget::All),
         InterpolationTarget::to_clients(NetworkTarget::All),
-        // in case the renderer is enabled on the server, we don't want the visuals to be replicated!
         DisableReplicateHierarchy,
         Transform::from_xyz(-200.0, 10.0, 0.0),
         RigidBody::Kinematic,
         Collider::circle(BOT_RADIUS),
-        // add the component to make lag-compensation possible!
         LagCompensationHistory::default(),
     ));
     commands.spawn((
@@ -110,8 +177,6 @@ pub(crate) fn spawn_bots(mut commands: Commands) {
         Name::new("PredictedBot"),
         Replicate::to_clients(NetworkTarget::All),
         PredictionTarget::to_clients(NetworkTarget::All),
-        // NOTE: all predicted entities must be part of the same replication group!
-        // in case the renderer is enabled on the server, we don't want the visuals to be replicated!
         DisableReplicateHierarchy,
         Transform::from_xyz(200.0, 10.0, 0.0),
         RigidBody::Kinematic,
@@ -119,11 +184,19 @@ pub(crate) fn spawn_bots(mut commands: Commands) {
     ));
 }
 
-/// Compute hits if the bullet hits the bot, and increment the score on the player
-pub(crate) fn compute_hit_lag_compensation(
-    // instead of directly using avian's SpatialQuery, we want to use the LagCompensationSpatialQuery
-    // to apply lag-compensation (i.e. compute the collision between the bullet and the collider as it
-    // was seen by the client when they fired the shot)
+fn interpolated_bot_movement(
+    timeline: Res<LocalTimeline>,
+    mut query: Query<&mut Position, With<InterpolatedBot>>,
+) {
+    let tick = timeline.tick();
+    query.iter_mut().for_each(|mut position| {
+        let direction = if (tick.0 / 200) % 2 == 0 { -1.0 } else { 1.0 };
+        position.y += crate::shared::BOT_MOVE_SPEED * direction;
+    });
+}
+
+/// Compute hits using lag compensation for interpolated bots
+pub fn compute_hit_lag_compensation(
     mut commands: Commands,
     timeline: Res<LocalTimeline>,
     query: LagCompensationSpatialQuery,
@@ -131,10 +204,7 @@ pub(crate) fn compute_hit_lag_compensation(
         (Entity, &PlayerId, &Position, &LinearVelocity, &ControlledBy),
         With<BulletMarker>,
     >,
-    // the InterpolationDelay component is stored directly on the client entity
-    // (the server creates one entity for each client to store client-specific
-    // metadata)
-    client_query: Query<&InterpolationDelay, With<ClientOf>>,
+    client_query: Query<&lightyear::interpolation::plugin::InterpolationDelay, With<ClientOf>>,
     mut player_query: Query<(&mut Score, &PlayerId), With<PlayerMarker>>,
 ) {
     let tick = timeline.tick();
@@ -142,16 +212,12 @@ pub(crate) fn compute_hit_lag_compensation(
         .iter()
         .for_each(|(entity, id, position, velocity, controlled_by)| {
             let Ok(delay) = client_query.get(controlled_by.owner) else {
-                error!("Could not retrieve InterpolationDelay for client {id:?}");
                 return;
             };
             if let Some(hit_data) = query.cast_ray(
-                // the delay is sent in every input message; the latest InterpolationDelay received
-                // is stored on the client entity
                 *delay,
                 position.0,
                 Dir2::new_unchecked(velocity.0.normalize()),
-                // TODO: shouldn't this be based on velocity length?
                 BULLET_COLLISION_DISTANCE_CHECK,
                 false,
                 &mut SpatialQueryFilter::default(),
@@ -162,7 +228,6 @@ pub(crate) fn compute_hit_lag_compensation(
                     ?entity,
                     "Collision with interpolated bot! Despawning bullet"
                 );
-                // if there is a hit, increment the score
                 player_query
                     .iter_mut()
                     .find(|(_, player_id)| player_id.0 == id.0)
@@ -174,15 +239,13 @@ pub(crate) fn compute_hit_lag_compensation(
         })
 }
 
-pub(crate) fn compute_hit_prediction(
+/// Compute hits for predicted bots (no lag compensation needed)
+pub fn compute_hit_prediction(
     mut commands: Commands,
     timeline: Res<LocalTimeline>,
     query: SpatialQuery,
     bullets: Query<(Entity, &PlayerId, &Position, &LinearVelocity), With<BulletMarker>>,
     bot_query: Query<(), With<PredictedBot>>,
-    // the InterpolationDelay component is stored directly on the client entity
-    // (the server creates one entity for each client to store client-specific
-    // metadata)
     mut player_query: Query<(&mut Score, &PlayerId), With<PlayerMarker>>,
 ) {
     let tick = timeline.tick();
@@ -190,22 +253,17 @@ pub(crate) fn compute_hit_prediction(
         if let Some(hit_data) = query.cast_ray_predicate(
             position.0,
             Dir2::new_unchecked(velocity.0.normalize()),
-            // TODO: shouldn't this be based on velocity length?
             BULLET_COLLISION_DISTANCE_CHECK,
             false,
             &SpatialQueryFilter::default(),
-            &|entity| {
-                // only confirm the hit on predicted bots
-                bot_query.get(entity).is_ok()
-            },
+            &|entity| bot_query.get(entity).is_ok(),
         ) {
             info!(
                 ?tick,
                 ?hit_data,
                 ?entity,
-                "Collision with predicted bot! Despawn bullet"
+                "Collision with predicted bot! Despawning bullet"
             );
-            // if there is a hit, increment the score
             player_query
                 .iter_mut()
                 .find(|(_, player_id)| player_id.0 == id.0)
@@ -215,16 +273,4 @@ pub(crate) fn compute_hit_prediction(
             commands.entity(entity).despawn();
         }
     })
-}
-
-fn interpolated_bot_movement(
-    timeline: Res<LocalTimeline>,
-    mut query: Query<&mut Position, With<InterpolatedBot>>,
-) {
-    let tick = timeline.tick();
-    query.iter_mut().for_each(|mut position| {
-        // change direction every 200ticks
-        let direction = if (tick.0 / 200) % 2 == 0 { 1.0 } else { -1.0 };
-        position.x += shared::BOT_MOVE_SPEED * direction;
-    });
 }

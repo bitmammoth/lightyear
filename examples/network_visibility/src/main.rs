@@ -1,65 +1,123 @@
-//! This example showcases how to use Lightyear with Bevy, to easily get replication along with prediction/interpolation working.
+//! Multi-Transport Network Visibility Example
 //!
-//! There is a lot of setup code, but it's mostly to have the examples work in all possible configurations of transport.
-//! (all transports are supported, as well as running the example in client-and-server or host-server mode)
+//! Demonstrates:
+//! - Server running UDP, WebTransport, and WebSocket transports
+//! - Interest management / network visibility based on distance
+//! - Circles are only visible to players within a certain radius
+//! - Players can connect via any transport and see consistent visibility behavior
 //!
+//! Usage:
+//!   # Start the server (runs UDP:5000, WebTransport:5001, WebSocket:5002)
+//!   cargo run -p network_visibility -- server
 //!
-//! Run with
-//! - `cargo run -- server`
-//! - `cargo run -- client -c 1`
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
+//!   # Connect via UDP (in another terminal)
+//!   cargo run -p network_visibility -- client --transport udp
+//!
+//!   # Connect via WebTransport (copy cert digest from server output)
+//!   cargo run -p network_visibility -- client --transport webtransport --cert <DIGEST>
+//!
+//!   # Connect via WebSocket
+//!   cargo run -p network_visibility -- client --transport websocket
 
-#[cfg(feature = "client")]
-use crate::client::ExampleClientPlugin;
-#[cfg(feature = "server")]
-use crate::server::ExampleServerPlugin;
-use crate::shared::SharedPlugin;
 use bevy::prelude::*;
+use clap::{Parser, Subcommand, ValueEnum};
 use core::time::Duration;
-use lightyear_examples_common::cli::{Cli, Mode};
-use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
+use lightyear::prelude::DebugUIPlugin;
 
-#[cfg(feature = "client")]
 mod client;
 mod protocol;
-#[cfg(feature = "gui")]
 mod renderer;
-#[cfg(feature = "server")]
 mod server;
-
 mod shared;
 
-/// When running the example as a binary, we only support Client or Server mode.
+use shared::*;
+
+#[derive(Parser)]
+#[command(name = "network_visibility")]
+#[command(about = "Multi-transport network visibility example")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run as server (UDP + WebTransport + WebSocket)
+    Server,
+    /// Run as client
+    Client {
+        /// Transport to use for connection
+        #[arg(short, long, default_value = "udp")]
+        transport: TransportArg,
+        /// Certificate digest (required for WebTransport)
+        #[arg(short, long)]
+        cert: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum TransportArg {
+    Udp,
+    Webtransport,
+    Websocket,
+}
+
 fn main() {
-    let cli = Cli::default();
-
-    let mut app = cli.build_app(Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ), true);
-
-    app.add_plugins(SharedPlugin);
-
-    cli.spawn_connections(&mut app);
-
-    match cli.mode {
-        #[cfg(feature = "client")]
-        Some(Mode::Client { .. }) => {
-            app.add_plugins(ExampleClientPlugin);
-        }
-        #[cfg(feature = "server")]
-        Some(Mode::Server) => {
-            app.add_plugins(ExampleServerPlugin);
-        }
-        #[cfg(all(feature = "client", feature = "server"))]
-        Some(Mode::HostClient { client_id }) => {
-            app.add_plugins(ExampleClientPlugin);
-            app.add_plugins(ExampleServerPlugin);
-        }
-        _ => {}
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::Server => run_server(),
+        Commands::Client { transport, cert } => run_client(transport, cert),
     }
+}
 
-    #[cfg(feature = "gui")]
-    app.add_plugins(renderer::ExampleRendererPlugin);
+fn run_server() {
+    App::new()
+        .add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
+            level: bevy::log::Level::INFO,
+            filter: "wgpu=error,naga=error,bevy_render=error,bevy_ecs=warn,bevy_app=warn,bevy_winit=warn,bevy_asset=warn".to_string(),
+            ..default()
+        }))
+        .add_plugins(lightyear::prelude::server::ServerPlugins {
+            tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+        })
+        .add_plugins(SharedPlugin)
+        .add_plugins(server::ExampleServerPlugin)
+        .add_plugins(renderer::ExampleRendererPlugin)
+        .add_plugins(DebugUIPlugin)
+        .run();
+}
 
-    app.run();
+fn run_client(transport: TransportArg, cert: Option<String>) {
+    // Generate a random client ID
+    let client_id: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64 % 100000;
+    
+    let transport_enum = match transport {
+        TransportArg::Udp => client::Transport::Udp,
+        TransportArg::Webtransport => client::Transport::WebTransport,
+        TransportArg::Websocket => client::Transport::WebSocket,
+    };
+    
+    App::new()
+        .add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
+            level: bevy::log::Level::INFO,
+            filter: "wgpu=error,naga=error,bevy_render=error,bevy_ecs=warn,bevy_app=warn,bevy_winit=warn,bevy_asset=warn".to_string(),
+            ..default()
+        }))
+        .insert_resource(client::ClientConfig {
+            client_id,
+            transport: transport_enum,
+            cert_digest: cert,
+        })
+        .add_plugins(lightyear::prelude::client::ClientPlugins {
+            tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+        })
+        .add_plugins(SharedPlugin)
+        .add_plugins(client::ExampleClientPlugin)
+        .add_plugins(renderer::ExampleRendererPlugin)
+        .add_plugins(DebugUIPlugin)
+        .run();
 }

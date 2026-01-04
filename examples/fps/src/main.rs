@@ -1,58 +1,92 @@
-#![allow(clippy::all)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
-use bevy::prelude::*;
-use core::time::Duration;
-use lightyear_examples_common::cli::{Cli, Mode};
-use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
+//! Multi-transport FPS example demonstrating:
+//! - Lag compensation for hit detection
+//! - Leafwing input manager for player actions
+//! - Avian2d physics for bullet movement
+//! - Multi-transport support (UDP, WebTransport, WebSocket)
+//!
+//! Run with:
+//! - `cargo run -p fps -- server`
+//! - `cargo run -p fps -- client -c 1 --transport udp`
+//! - `cargo run -p fps -- client -c 2 --transport web-transport`
+//! - `cargo run -p fps -- client -c 3 --transport web-socket`
 
-#[cfg(feature = "client")]
-use crate::client::ExampleClientPlugin;
-#[cfg(feature = "server")]
-use crate::server::ExampleServerPlugin;
-use crate::shared::SharedPlugin;
-
-#[cfg(feature = "client")]
 mod client;
 mod protocol;
+mod server;
+mod shared;
 
 #[cfg(feature = "gui")]
 mod renderer;
 
-#[cfg(feature = "server")]
-mod server;
-mod shared;
+use clap::{Parser, Subcommand, ValueEnum};
+use std::net::Ipv4Addr;
+use std::time::Duration;
+
+use bevy::prelude::*;
+
+pub const SERVER_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
+pub const UDP_PORT: u16 = 5000;
+pub const WEBTRANSPORT_PORT: u16 = 5001;
+pub const WEBSOCKET_PORT: u16 = 5002;
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
+
+#[derive(Parser)]
+#[command(name = "fps")]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// Run as dedicated server (all transports)
+    Server,
+    /// Run as client
+    Client {
+        /// Client ID
+        #[arg(short, long)]
+        client_id: u64,
+        /// Transport to use
+        #[arg(short, long, default_value = "udp")]
+        transport: TransportArg,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum TransportArg {
+    Udp,
+    WebTransport,
+    WebSocket,
+}
 
 fn main() {
-    let cli = Cli::default();
-
-    let mut app = cli.build_app(Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ), true);
-
-    app.add_plugins(SharedPlugin);
-
-    cli.spawn_connections(&mut app);
-
+    let cli = Cli::parse();
+    
+    let mut app = App::new();
+    
+    app.add_plugins(DefaultPlugins);
+    app.add_plugins(shared::SharedPlugin);
+    
     match cli.mode {
-        #[cfg(feature = "client")]
-        Some(Mode::Client { .. }) => {
-            app.add_plugins(ExampleClientPlugin);
+        Mode::Server => {
+            app.add_plugins(lightyear::prelude::server::ServerPlugins {
+                tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+            });
+            app.add_plugins(server::ServerPlugin);
         }
-        #[cfg(feature = "server")]
-        Some(Mode::Server) => {
-            app.add_plugins(ExampleServerPlugin);
+        Mode::Client { client_id, transport } => {
+            app.add_plugins(lightyear::prelude::client::ClientPlugins {
+                tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+            });
+            app.add_plugins(client::ClientPlugin);
+            
+            // Connect client to dedicated server
+            client::connect_client(&mut app, client_id, transport);
         }
-        #[cfg(all(feature = "client", feature = "server"))]
-        Some(Mode::HostClient { client_id }) => {
-            app.add_plugins(ExampleClientPlugin);
-            app.add_plugins(ExampleServerPlugin);
-        }
-        _ => {}
     }
-
+    
     #[cfg(feature = "gui")]
-    app.add_plugins(renderer::ExampleRendererPlugin);
-
-    // run the app
+    app.add_plugins(renderer::RendererPlugin);
+    
     app.run();
 }

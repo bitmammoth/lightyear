@@ -1,9 +1,9 @@
-//! This module contains the shared code between the client and the server.
+//! Shared code between client and server
+
 use bevy::prelude::*;
 
 use crate::protocol::*;
 
-#[derive(Clone)]
 pub struct SharedPlugin;
 
 impl Plugin for SharedPlugin {
@@ -12,9 +12,8 @@ impl Plugin for SharedPlugin {
     }
 }
 
-// This system defines how we update the player's positions when we receive an input
-pub(crate) fn shared_movement_behaviour(mut position: Mut<PlayerPosition>, input: &Inputs) {
-    const MOVE_SPEED: f32 = 10.0;
+/// Shared movement behavior
+pub fn shared_movement_behaviour(mut position: Mut<PlayerPosition>, input: &Inputs) {
     match input {
         Inputs::Direction(direction) => {
             if direction.up {

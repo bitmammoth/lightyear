@@ -1,99 +1,199 @@
-use avian2d::prelude::*;
-use bevy::app::PluginGroupBuilder;
-use bevy::prelude::*;
-use core::time::Duration;
-use leafwing_input_manager::prelude::*;
-use lightyear::connection::host::HostClient;
-use lightyear::prelude::client::*;
-use lightyear::prelude::*;
+//! Client implementation with transport selection and avian2d physics
 
 use crate::protocol::*;
-use crate::shared;
-use crate::shared::{color_from_id, shared_movement_behaviour, SharedPlugin};
+use crate::shared::*;
+use crate::TransportArg;
+use avian2d::prelude::*;
+use bevy::prelude::*;
+use core::net::{Ipv4Addr, SocketAddr};
+use core::time::Duration;
+use leafwing_input_manager::prelude::*;
+use lightyear::connection::client::{Connected, Connecting, Disconnected};
+use lightyear::netcode::Key;
+use lightyear::prelude::client::*;
+use lightyear::prelude::*;
+use lightyear::websocket::prelude::client::ClientConfig as WebSocketClientConfig;
+
+pub fn run_client(transport: TransportArg, cert: Option<String>) {
+    let mut app = App::new();
+    
+    app.add_plugins(DefaultPlugins);
+    
+    // Lightyear client plugin
+    app.add_plugins(lightyear::prelude::client::ClientPlugins {
+        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    });
+    
+    // Shared protocol + physics
+    app.add_plugins(SharedPlugin);
+    
+    // Client-specific plugin
+    app.add_plugins(ExampleClientPlugin);
+    
+    // Store config for startup
+    app.insert_resource(ClientConfig {
+        client_id: rand::random::<u64>(),
+        transport,
+        cert_digest: cert,
+    });
+    
+    app.run();
+}
+
+#[derive(Resource)]
+pub struct ClientConfig {
+    pub client_id: u64,
+    pub transport: TransportArg,
+    pub cert_digest: Option<String>,
+}
 
 pub struct ExampleClientPlugin;
 
 impl Plugin for ExampleClientPlugin {
     fn build(&self, app: &mut App) {
-        // all actions related-system that can be rolled back should be in FixedUpdate schedule
-        app.add_systems(FixedUpdate, player_movement);
-        app.add_observer(add_ball_physics);
-        app.add_observer(handle_interpolated_spawn);
+        app.add_systems(Startup, (setup_camera, spawn_connection, spawn_walls_local));
+        app.add_observer(on_connecting);
+        app.add_observer(on_connected);
+        app.add_observer(on_disconnected);
         app.add_observer(handle_predicted_spawn);
-
-        // DEBUG
-        app.add_systems(PostUpdate, print_overstep);
+        app.add_observer(handle_ball_spawn);
+        app.add_systems(FixedUpdate, player_movement);
+        app.add_systems(Update, render_entities);
     }
 }
 
-/// Blueprint pattern: when the ball gets replicated from the server, add all the components
-/// that we need that are not replicated.
-/// (for example physical properties that are constant, so they don't need to be networked)
-///
-/// We only add the physical properties on the ball that is displayed on screen (i.e the Predicted ball)
-/// We want the ball to be rigid so that when players collide with it, they bounce off.
-///
-/// However we remove the Position because we want the balls position to be interpolated, without being computed/updated
-/// by the physics engine? Actually this shouldn't matter because we run interpolation in PostUpdate...
-fn add_ball_physics(
-    trigger: On<Add, BallMarker>,
-    mut commands: Commands,
-    ball_query: Query<(), With<Predicted>>,
-) {
-    if let Ok(()) = ball_query.get(trigger.entity) {
-        commands
-            .entity(trigger.entity)
-            .insert(PhysicsBundle::ball());
+fn setup_camera(mut commands: Commands) {
+    commands.spawn(Camera2d);
+}
+
+/// Spawn local copies of walls (they're not replicated)
+fn spawn_walls_local(mut commands: Commands) {
+    spawn_walls(&mut commands);
+}
+
+fn on_connecting(trigger: On<Add, Connecting>, names: Query<&Name>) {
+    if let Ok(name) = names.get(trigger.entity) {
+        info!("🔄 {} is connecting...", name);
     }
 }
 
-// The client input only gets applied to predicted entities that we own
-// This works because we only predict the user's controlled entity.
-// If we were predicting more entities, we would have to only apply movement to the player owned one.
-fn player_movement(
-    // In host-server mode, the players are already moved by the server system so we don't want
-    // to move them twice.
-    timeline: Res<LocalTimeline>,
-    mut velocity_query: Query<
-        (
-            Entity,
-            &PlayerId,
-            &Position,
-            &mut LinearVelocity,
-            &ActionState<PlayerActions>,
-        ),
-        With<Predicted>,
-    >,
-) {
-    let tick = timeline.tick();
-    for (entity, player_id, position, velocity, action_state) in velocity_query.iter_mut() {
-        if !action_state.get_pressed().is_empty() {
-            trace!(?entity, ?tick, ?position, actions = ?action_state.get_pressed(), "applying movement to predicted player");
-            // note that we also apply the input to the other predicted clients! even though
-            //  their inputs are only replicated with a delay!
-            // TODO: add input decay?
-            shared_movement_behaviour(velocity, action_state);
+fn on_connected(trigger: On<Add, Connected>, names: Query<&Name>) {
+    if let Ok(name) = names.get(trigger.entity) {
+        info!("✅ {} connected to server!", name);
+    }
+}
+
+fn on_disconnected(trigger: On<Add, Disconnected>, names: Query<&Name>) {
+    if let Ok(name) = names.get(trigger.entity) {
+        info!("❌ {} disconnected from server", name);
+    }
+}
+
+fn spawn_connection(mut commands: Commands, config: Res<ClientConfig>) {
+    let client_port = 4000 + (config.client_id % 100) as u16;
+    let client_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_port);
+    
+    match config.transport {
+        TransportArg::Udp => {
+            let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), SERVER_UDP_PORT);
+            info!("📡 Connecting via UDP to {}", server_addr);
+            let auth = Authentication::Manual {
+                server_addr,
+                client_id: config.client_id,
+                private_key: Key::default(),
+                protocol_id: PROTOCOL_ID,
+            };
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(server_addr),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(auth, NetcodeConfig::default()).unwrap(),
+                    UdpIo::default(),
+                    Name::new("UdpClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
+        }
+        TransportArg::Webtransport => {
+            let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), SERVER_WEBTRANSPORT_PORT);
+            info!("🌐 Connecting via WebTransport to {}", server_addr);
+            let auth = Authentication::Manual {
+                server_addr,
+                client_id: config.client_id,
+                private_key: Key::default(),
+                protocol_id: PROTOCOL_ID,
+            };
+            let cert_digest_raw = config.cert_digest.clone().expect("WebTransport requires --cert <digest>");
+            let cert_digest = cert_digest_raw.replace(":", "");
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(server_addr),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(auth, NetcodeConfig::default()).unwrap(),
+                    WebTransportClientIo {
+                        certificate_digest: cert_digest,
+                    },
+                    Name::new("WebTransportClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
+        }
+        TransportArg::Websocket => {
+            let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), SERVER_WEBSOCKET_PORT);
+            info!("🔌 Connecting via WebSocket to {}", server_addr);
+            let auth = Authentication::Manual {
+                server_addr,
+                client_id: config.client_id,
+                private_key: Key::default(),
+                protocol_id: PROTOCOL_ID,
+            };
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(server_addr),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(auth, NetcodeConfig::default()).unwrap(),
+                    WebSocketClientIo {
+                        config: WebSocketClientConfig::builder().with_no_cert_validation(),
+                        scheme: WebSocketScheme::Secure,
+                    },
+                    Name::new("WebSocketClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
         }
     }
+    
+    info!("🔗 Connection initiated...\n");
 }
 
-// When the predicted copy of the client-owned entity is spawned, do stuff
-// - assign it a different saturation
-// - add physics components so that its movement can be predicted
-pub(crate) fn handle_predicted_spawn(
+/// When predicted player spawns, add physics and input mappings
+fn handle_predicted_spawn(
     trigger: On<Add, (PlayerId, Predicted)>,
     mut commands: Commands,
     mut player_query: Query<(&mut ColorComponent, Has<Controlled>), With<Predicted>>,
 ) {
     if let Ok((mut color, controlled)) = player_query.get_mut(trigger.entity) {
+        // Desaturate predicted entities
         let hsva = Hsva {
             saturation: 0.4,
             ..Hsva::from(color.0)
         };
         color.0 = Color::from(hsva);
+        
         let mut entity_mut = commands.entity(trigger.entity);
         entity_mut.insert(PhysicsBundle::player());
+        
         if controlled {
+            info!("🎮 Adding input mappings to controlled player {:?}", trigger.entity);
             entity_mut.insert(InputMap::new([
                 (PlayerActions::Up, KeyCode::KeyW),
                 (PlayerActions::Down, KeyCode::KeyS),
@@ -104,25 +204,62 @@ pub(crate) fn handle_predicted_spawn(
     }
 }
 
-// When the interpolated copy of the client-owned entity is spawned, do stuff
-// - assign it a different color
-pub(crate) fn handle_interpolated_spawn(
-    trigger: On<Add, ColorComponent>,
-    mut interpolated: Query<&mut ColorComponent, Added<Interpolated>>,
+/// Add physics to predicted ball
+fn handle_ball_spawn(
+    trigger: On<Add, BallMarker>,
+    mut commands: Commands,
+    ball_query: Query<(), With<Predicted>>,
 ) {
-    if let Ok(mut color) = interpolated.get_mut(trigger.entity) {
-        let hsva = Hsva {
-            saturation: 0.1,
-            ..Hsva::from(color.0)
-        };
-        color.0 = Color::from(hsva);
+    if ball_query.get(trigger.entity).is_ok() {
+        commands.entity(trigger.entity).insert(PhysicsBundle::ball());
     }
 }
 
-// Debug system to check on the oversteps
-fn print_overstep(time: Res<Time<Fixed>>, timeline: Single<&InputTimeline, With<Client>>) {
-    let input_overstep = timeline.overstep();
-    let input_overstep_ms = input_overstep.to_f32() * (time.timestep().as_millis() as f32);
-    let time_overstep = time.overstep();
-    trace!(?input_overstep_ms, ?time_overstep, "overstep");
+/// Client-side movement - only on predicted entities we own
+fn player_movement(
+    mut velocity_query: Query<
+        (&mut LinearVelocity, &ActionState<PlayerActions>),
+        With<Predicted>,
+    >,
+) {
+    for (velocity, action_state) in velocity_query.iter_mut() {
+        if !action_state.get_pressed().is_empty() {
+            shared_movement_behaviour(velocity, action_state);
+        }
+    }
+}
+
+/// Render entities as colored sprites
+fn render_entities(
+    mut commands: Commands,
+    players: Query<(Entity, &ColorComponent), (With<PlayerId>, Without<Sprite>)>,
+    balls: Query<(Entity, &ColorComponent), (With<BallMarker>, Without<Sprite>)>,
+    walls: Query<(Entity, &ColorComponent, &Collider), (Without<PlayerId>, Without<BallMarker>, Without<Sprite>)>,
+) {
+    // Render players
+    for (entity, color) in players.iter() {
+        commands.entity(entity).insert(Sprite {
+            color: color.0,
+            custom_size: Some(Vec2::splat(PLAYER_SIZE)),
+            ..default()
+        });
+    }
+    
+    // Render balls
+    for (entity, color) in balls.iter() {
+        commands.entity(entity).insert(Sprite {
+            color: color.0,
+            custom_size: Some(Vec2::splat(BALL_SIZE * 2.0)),
+            ..default()
+        });
+    }
+    
+    // Render walls
+    for (entity, color, _collider) in walls.iter() {
+        commands.entity(entity).insert(Sprite {
+            color: color.0,
+            custom_size: Some(Vec2::new(10.0, 700.0)), // Approximate wall size
+            ..default()
+        });
+    }
 }

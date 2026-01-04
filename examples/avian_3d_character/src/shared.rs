@@ -1,33 +1,60 @@
-use bevy::ecs::query::QueryData;
-use bevy::math::VectorSpace;
-use bevy::prelude::*;
-use core::hash::Hash;
+//! Shared code between client and server
 
 use crate::protocol::*;
-use avian3d::prelude::forces::ForcesItem;
 use avian3d::prelude::*;
+use bevy::prelude::*;
+use core::time::Duration;
 use leafwing_input_manager::prelude::ActionState;
 use lightyear::avian3d::plugin::AvianReplicationMode;
-use lightyear::connection::client_of::ClientOf;
-use lightyear::input::leafwing::prelude::LeafwingBuffer;
 use lightyear::prelude::*;
-use lightyear_frame_interpolation::FrameInterpolate;
 
-pub const FLOOR_WIDTH: f32 = 100.0;
-pub const FLOOR_HEIGHT: f32 = 1.0;
+// Network settings
+pub const PROTOCOL_ID: u64 = 0;
+pub const PRIVATE_KEY: [u8; 32] = [0u8; 32];
 
-pub const BLOCK_WIDTH: f32 = 1.0;
-pub const BLOCK_HEIGHT: f32 = 1.0;
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
+pub const SERVER_REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
+// Server ports
+pub const SERVER_UDP_PORT: u16 = 5000;
+pub const SERVER_WEBTRANSPORT_PORT: u16 = 5001;
+pub const SERVER_WEBSOCKET_PORT: u16 = 5002;
+
+// Character dimensions
 pub const CHARACTER_CAPSULE_RADIUS: f32 = 0.5;
 pub const CHARACTER_CAPSULE_HEIGHT: f32 = 0.5;
 
+// Floor dimensions
+pub const FLOOR_WIDTH: f32 = 100.0;
+pub const FLOOR_HEIGHT: f32 = 1.0;
+
+pub struct SharedPlugin;
+
+impl Plugin for SharedPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(ProtocolPlugin);
+
+        // Physics plugins
+        app.add_plugins(lightyear::avian3d::plugin::LightyearAvianPlugin {
+            replication_mode: AvianReplicationMode::Position,
+            ..default()
+        });
+        app.add_plugins(
+            PhysicsPlugins::default()
+                .build()
+                .disable::<PhysicsTransformPlugin>()
+                .disable::<PhysicsInterpolationPlugin>(),
+        );
+    }
+}
+
+/// Character physics bundle
 #[derive(Bundle)]
-pub(crate) struct CharacterPhysicsBundle {
-    collider: Collider,
-    rigid_body: RigidBody,
-    lock_axes: LockedAxes,
-    friction: Friction,
+pub struct CharacterPhysicsBundle {
+    pub collider: Collider,
+    pub rigid_body: RigidBody,
+    pub lock_axes: LockedAxes,
+    pub friction: Friction,
 }
 
 impl Default for CharacterPhysicsBundle {
@@ -44,10 +71,11 @@ impl Default for CharacterPhysicsBundle {
     }
 }
 
+/// Floor physics bundle
 #[derive(Bundle)]
-pub(crate) struct FloorPhysicsBundle {
-    collider: Collider,
-    rigid_body: RigidBody,
+pub struct FloorPhysicsBundle {
+    pub collider: Collider,
+    pub rigid_body: RigidBody,
 }
 
 impl Default for FloorPhysicsBundle {
@@ -59,185 +87,47 @@ impl Default for FloorPhysicsBundle {
     }
 }
 
-#[derive(Bundle)]
-pub(crate) struct BlockPhysicsBundle {
-    collider: Collider,
-    rigid_body: RigidBody,
-}
-
-impl Default for BlockPhysicsBundle {
-    fn default() -> Self {
-        Self {
-            collider: Collider::cuboid(BLOCK_WIDTH, BLOCK_HEIGHT, BLOCK_WIDTH),
-            rigid_body: RigidBody::Dynamic,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SharedPlugin;
-
-impl Plugin for SharedPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_plugins(ProtocolPlugin);
-
-        // Physics
-        app.add_plugins(lightyear::avian3d::plugin::LightyearAvianPlugin {
-            replication_mode: AvianReplicationMode::Position,
-            ..default()
-        });
-        app.add_plugins(
-            PhysicsPlugins::default()
-                .build()
-                // disable the position<>transform sync plugins as it is handled by lightyear_avian
-                .disable::<PhysicsTransformPlugin>()
-                .disable::<PhysicsInterpolationPlugin>(), // disable Sleeping plugin as it can mess up physics rollbacks
-                                                          // .disable::<IslandSleepingPlugin>(),
-        );
-
-        // Debug
-        app.add_systems(FixedLast, fixed_last_log);
-        app.add_systems(Last, last_log);
-    }
-}
-
-/// Generate pseudo-random color based on `client_id`.
-// Updated to use PeerId
-pub(crate) fn color_from_id(client_id: PeerId) -> Color {
+/// Generate color from client ID
+pub fn color_from_id(client_id: PeerId) -> Color {
     let h = (((client_id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
     let s = 1.0;
     let l = 0.5;
     Color::hsl(h, s, l)
 }
 
-/// Apply the character actions `action_state` to the character entity `character`.
+/// Apply character movement
 pub fn apply_character_action(
     entity: Entity,
-    mass: &ComputedMass,
-    time: &Res<Time>,
+    velocity: &mut LinearVelocity,
     spatial_query: &SpatialQuery,
     action_state: &ActionState<CharacterAction>,
-    mut forces: ForcesItem,
+    position: &Position,
 ) {
     const MAX_SPEED: f32 = 5.0;
-    const MAX_ACCELERATION: f32 = 20.0;
+    const MOVE_FORCE: f32 = 20.0;
+    const JUMP_IMPULSE: f32 = 10.0;
 
-    // How much velocity can change in a single tick given the max acceleration.
-    let max_velocity_delta_per_tick = MAX_ACCELERATION * time.delta_secs();
+    // Movement
+    let axis_pair = action_state.clamped_axis_pair(&CharacterAction::Move);
+    let move_dir = Vec3::new(axis_pair.x, 0.0, -axis_pair.y);
+    if move_dir.length_squared() > 0.01 {
+        velocity.x = (velocity.x + move_dir.x * MOVE_FORCE * 0.016).clamp(-MAX_SPEED, MAX_SPEED);
+        velocity.z = (velocity.z + move_dir.z * MOVE_FORCE * 0.016).clamp(-MAX_SPEED, MAX_SPEED);
+    }
 
-    // Handle jumping.
+    // Jumping
     if action_state.just_pressed(&CharacterAction::Jump) {
-        let ray_cast_origin = forces.position().0
-            + Vec3::new(
-                0.0,
-                -CHARACTER_CAPSULE_HEIGHT / 2.0 - CHARACTER_CAPSULE_RADIUS,
-                0.0,
-            );
-
-        // Only jump if the character is on the ground.
-        //
-        // Check if we are touching the ground by sending a ray from the bottom
-        // of the character downwards.
-        if spatial_query
-            .cast_ray(
-                ray_cast_origin,
-                Dir3::NEG_Y,
-                0.01,
-                true,
-                &SpatialQueryFilter::from_excluded_entities([entity]),
-            )
-            .is_some()
-        {
-            forces.apply_linear_impulse(Vec3::new(0.0, 5.0, 0.0));
+        let ray_origin = position.0 + Vec3::new(0.0, -CHARACTER_CAPSULE_HEIGHT / 2.0 - CHARACTER_CAPSULE_RADIUS, 0.0);
+        
+        // Check if grounded
+        if spatial_query.cast_ray(
+            ray_origin,
+            Dir3::NEG_Y,
+            0.1,
+            true,
+            &SpatialQueryFilter::from_excluded_entities([entity]),
+        ).is_some() {
+            velocity.y = JUMP_IMPULSE;
         }
-    }
-
-    // Handle moving.
-    let move_dir = action_state
-        .axis_pair(&CharacterAction::Move)
-        .clamp_length_max(1.0);
-    let move_dir = Vec3::new(-move_dir.x, 0.0, move_dir.y);
-
-    // Linear velocity of the character ignoring vertical speed.
-    let linear_velocity = forces.linear_velocity();
-    let ground_linear_velocity = Vec3::new(linear_velocity.x, 0.0, linear_velocity.z);
-
-    let desired_ground_linear_velocity = move_dir * MAX_SPEED;
-
-    let new_ground_linear_velocity = ground_linear_velocity
-        .move_towards(desired_ground_linear_velocity, max_velocity_delta_per_tick);
-
-    // Acceleration required to change the linear velocity from
-    // `ground_linear_velocity` to `new_ground_linear_velocity` in the duration
-    // of a single tick.
-    //
-    // There is no need to clamp the acceleration's length to
-    // `MAX_ACCELERATION`. The difference between `ground_linear_velocity` and
-    // `new_ground_linear_velocity` is never great enough to require more than
-    // `MAX_ACCELERATION` in a single tick, This is because
-    // `new_ground_linear_velocity` is calculated using
-    // `max_velocity_delta_per_tick` which restricts how much the velocity can
-    // change in a single tick based on `MAX_ACCELERATION`.
-    let required_acceleration =
-        (new_ground_linear_velocity - ground_linear_velocity) / time.delta_secs();
-
-    forces.apply_force(required_acceleration * mass.value());
-}
-
-pub(crate) fn fixed_last_log(
-    timeline: Res<LocalTimeline>,
-    players: Query<
-        (
-            Entity,
-            &Position,
-            Option<&VisualCorrection<Position>>,
-            Option<&ActionState<CharacterAction>>,
-            Option<&LeafwingBuffer<CharacterAction>>,
-        ),
-        With<CharacterMarker>,
-    >,
-) {
-    let tick = timeline.tick();
-
-    for (entity, position, correction, action_state, input_buffer) in players.iter() {
-        let pressed = action_state.map(|a| a.axis_pair(&CharacterAction::Move));
-        let last_buffer_tick = input_buffer.and_then(|b| b.get_last_with_tick().map(|(t, _)| t));
-        info!(
-            ?tick,
-            ?entity,
-            ?position,
-            ?correction,
-            ?pressed,
-            ?last_buffer_tick,
-            "Player - FixedLast"
-        );
-    }
-}
-
-pub(crate) fn last_log(
-    timeline: Res<LocalTimeline>,
-    players: Query<
-        (
-            Entity,
-            &Position,
-            &Transform,
-            Option<&FrameInterpolate<Position>>,
-            Option<&VisualCorrection<Position>>,
-        ),
-        With<CharacterMarker>,
-    >,
-) {
-    let tick = timeline.tick();
-
-    for (entity, position, transform, interpolate, correction) in players.iter() {
-        info!(
-            ?tick,
-            ?entity,
-            ?position,
-            ?transform,
-            ?interpolate,
-            ?correction,
-            "Player - Last"
-        );
     }
 }

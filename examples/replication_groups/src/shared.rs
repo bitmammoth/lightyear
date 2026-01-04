@@ -1,74 +1,76 @@
-use bevy::prelude::*;
+//! Shared code between client and server.
 
-use crate::protocol::Direction;
-use crate::protocol::*;
+use bevy::prelude::*;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::time::Duration;
 use lightyear::prelude::*;
 
-#[derive(Clone)]
+use crate::protocol::*;
+
+// ============ Constants ============
+
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
+pub const SERVER_REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
+pub const MOVE_SPEED: f32 = 10.0;
+pub const TRAIL_OFFSET: f32 = 50.0;  // How far behind the trail follows
+
+pub const UDP_PORT: u16 = 5000;
+pub const WEBTRANSPORT_PORT: u16 = 5001;
+pub const WEBSOCKET_PORT: u16 = 5002;
+
+pub const UDP_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), UDP_PORT);
+pub const WEBTRANSPORT_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBTRANSPORT_PORT);
+pub const WEBSOCKET_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBSOCKET_PORT);
+
+// ============ Plugin ============
+
 pub struct SharedPlugin;
 
 impl Plugin for SharedPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ProtocolPlugin);
+        // Trail follows head in FixedUpdate
+        app.add_systems(FixedUpdate, update_trail_position);
     }
 }
 
-// This system defines how we update the player's positions when we receive an input
-pub(crate) fn shared_movement_behaviour(mut position: Mut<PlayerPosition>, input: &Inputs) {
-    const MOVE_SPEED: f32 = 10.0;
-    match input {
-        Inputs::Direction(direction) => match direction {
-            Direction::Up => position.y += MOVE_SPEED,
-            Direction::Down => position.y -= MOVE_SPEED,
-            Direction::Left => position.x -= MOVE_SPEED,
-            Direction::Right => position.x += MOVE_SPEED,
-        },
-        _ => {}
+// ============ Helpers ============
+
+/// Shared player movement behavior
+pub fn shared_movement_behaviour(mut position: Mut<PlayerPosition>, input: &Inputs) {
+    if let Inputs::Direction(direction) = input {
+        if direction.up {
+            position.0.y += MOVE_SPEED;
+        }
+        if direction.down {
+            position.0.y -= MOVE_SPEED;
+        }
+        if direction.left {
+            position.0.x -= MOVE_SPEED;
+        }
+        if direction.right {
+            position.0.x += MOVE_SPEED;
+        }
     }
 }
 
-// This system defines how we update the player's tails when the head is updated
-// Note: we only apply logic for the Predicted entity on the client (Interpolated is updated
-// during interpolation, and Confirmed is just replicated from Server)
-pub(crate) fn shared_tail_behaviour(
-    player_position: Query<Ref<PlayerPosition>, Or<(With<Predicted>, With<Replicate>)>>,
-    mut tails: Query<
-        (&mut TailPoints, &PlayerParent, &TailLength),
-        Or<(With<Predicted>, With<ReplicateLike>)>,
-    >,
+/// Update trail positions to follow their parent player
+/// This runs on both client (for predicted entities) and server
+pub fn update_trail_position(
+    player_query: Query<Ref<PlayerPosition>, Or<(With<Predicted>, With<Replicate>)>>,
+    mut trail_query: Query<(&mut TrailPosition, &PlayerParent), Or<(With<Predicted>, With<ReplicateLike>)>>,
 ) {
-    for (mut points, parent, length) in tails.iter_mut() {
-        let Ok(parent_position) = player_position.get(parent.0) else {
-            error!("Tail entity has no parent entity!");
+    for (mut trail_pos, parent) in trail_query.iter_mut() {
+        let Ok(player_pos) = player_query.get(parent.0) else {
             continue;
         };
-        // if the parent position didn't change, we don't need to update the tail
-        // (also makes sure we don't trigger change detection for the tail! which would mean we add
-        //  new elements to the tail's history buffer)
-        if !parent_position.is_changed() {
+        
+        // Only update if player position changed (avoids spurious change detection)
+        if !player_pos.is_changed() {
             continue;
         }
-        // Update the front if the head turned
-        let (front_pos, front_dir) = points.0.front().unwrap().clone();
-        // NOTE: we do not deal with diagonal directions in this example
-        let front_direction = Direction::from_points(front_pos, parent_position.0);
-        // if the head is going in a new direction, add a new point to the front
-        if front_direction.map_or(true, |dir| dir != front_dir) {
-            trace!(
-                old_front_dir = ?front_dir,
-                new_front_dir = ?front_direction,
-                "creating new inflection point");
-            let inflection_pos = match front_dir {
-                Direction::Up | Direction::Down => Vec2::new(front_pos.x, parent_position.y),
-                Direction::Left | Direction::Right => Vec2::new(parent_position.x, front_pos.y),
-            };
-            let new_front_dir = Direction::from_points(inflection_pos, parent_position.0).unwrap();
-            points.0.push_front((inflection_pos, new_front_dir));
-            trace!(?points, "new points");
-        }
-
-        // Update the back
-        // remove the back points that are above the length
-        points.shorten_back(parent_position.0, length.0);
+        
+        // Trail follows behind the player
+        trail_pos.0 = Vec2::new(player_pos.0.x - TRAIL_OFFSET, player_pos.0.y - TRAIL_OFFSET);
     }
 }

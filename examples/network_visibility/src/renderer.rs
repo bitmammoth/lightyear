@@ -1,14 +1,15 @@
-use crate::protocol::*;
+//! Renderer module - draws players and circles.
+
 use bevy::color::palettes::basic::GREEN;
 use bevy::prelude::*;
+use crate::protocol::*;
 
-#[derive(Clone)]
 pub struct ExampleRendererPlugin;
 
 impl Plugin for ExampleRendererPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, init);
-        app.add_systems(Update, (draw_boxes, draw_circles));
+        app.add_systems(Update, (draw_players, draw_circles));
     }
 }
 
@@ -16,10 +17,11 @@ fn init(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-/// System that draws the boxed of the player positions.
-/// The components should be replicated from the server to the client
-/// This time we will only draw the predicted/interpolated entities
-pub(crate) fn draw_boxes(mut gizmos: Gizmos, players: Query<(&Position, &PlayerColor)>) {
+/// Draw player boxes with their assigned colors
+pub fn draw_players(
+    mut gizmos: Gizmos,
+    players: Query<(&Position, &PlayerColor), Without<CircleMarker>>,
+) {
     for (position, color) in &players {
         gizmos.rect(
             Isometry3d::from_translation(Vec3::new(position.x, position.y, 0.0)),
@@ -29,9 +31,12 @@ pub(crate) fn draw_boxes(mut gizmos: Gizmos, players: Query<(&Position, &PlayerC
     }
 }
 
-/// System that draws circles
-pub(crate) fn draw_circles(mut gizmos: Gizmos, circles: Query<&Position, With<CircleMarker>>) {
+/// Draw circles (small green dots) - only visible ones will be present
+pub fn draw_circles(
+    mut gizmos: Gizmos,
+    circles: Query<&Position, With<CircleMarker>>,
+) {
     for position in &circles {
-        gizmos.circle_2d(Isometry2d::from_translation(position.0), 1.0, GREEN);
+        gizmos.circle_2d(Isometry2d::from_translation(position.0), 5.0, GREEN);
     }
 }

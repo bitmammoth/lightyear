@@ -1,27 +1,39 @@
-# Simple setup 
+# Multi-Transport Simple Setup Example
 
-This minimal example shows how to create a bevy app with the lightyear client and server plugins.
+This minimal example showcases how to setup lightyear with multiple transports (UDP, WebTransport, WebSocket).
 
+## Running
 
-## Running an example
+### Start Server
+```bash
+cargo run -p simple_setup -- server
+```
 
-- Run the server with a gui: `cargo run -- server`
-- Run client with id 1: `cargo run -- client -c 1`
+The server will start all three transports:
+- UDP on port 5000
+- WebTransport on port 5001 (prints certificate digest)  
+- WebSocket on port 5002
 
-[//]: # (- Run the client and server in two separate bevy Apps: `cargo run` or `cargo run separate`)
-- Run the server without a gui: `cargo run --no-default-features --features=server -- server`
-- Run the client and server in "HostClient" mode, where the client also acts as server (both are in the same App) : `cargo run -- host-client -c 0`
+### Connect Clients
 
-You can control the behaviour of the example by changing the list of features. By default, all features are enabled (client, server, gui).
-For example you can run the server in headless mode (without gui) by running `cargo run --no-default-features --features=server,udp,netcode`.
+**UDP:**
+```bash
+cargo run -p simple_setup -- client -t udp
+```
 
-### Testing in wasm with webtransport
+**WebSocket:**
+```bash
+cargo run -p simple_setup -- client -t websocket
+```
 
-NOTE: I am using the [bevy cli](https://github.com/TheBevyFlock/bevy_cli) to build and serve the wasm example.
+**WebTransport:**
+```bash
+# Copy certificate digest from server output
+cargo run -p simple_setup -- client -t webtransport -c <DIGEST>
+```
 
-To test the example in wasm, you can run the following commands: `bevy run web`
+## Key Multi-Transport Concepts
 
-You will need a valid SSL certificate to test the example in wasm using webtransport. You will need to run the following
-commands to generate a self-signed certificate:
-- `cd "$(git rev-parse --show-toplevel)" && sh certificates/generate.sh` (to generate the temporary SSL
-  certificates, they are only valid for 2 weeks)
+1. **Single logical Server entity** - All transports point to one Server via `TransportOf`
+2. **Multiple transport entities** - Each transport (UDP, WT, WS) is a separate entity
+3. **Unified client handling** - Clients appear the same regardless of transport

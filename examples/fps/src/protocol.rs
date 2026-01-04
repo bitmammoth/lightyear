@@ -1,16 +1,16 @@
+//! Protocol definitions for the FPS example
+
 use avian2d::prelude::*;
 use bevy::prelude::*;
 use leafwing_input_manager::prelude::*;
-use lightyear::input::prelude::InputConfig;
 use lightyear::prelude::input::leafwing;
-use lightyear::prelude::Channel;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::color_from_id;
-
 pub const BULLET_SIZE: f32 = 3.0;
 pub const PLAYER_SIZE: f32 = 40.0;
+
+// ============ Components ============
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct PredictedBot;
@@ -18,7 +18,6 @@ pub struct PredictedBot;
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct InterpolatedBot;
 
-// Components
 #[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct PlayerId(pub PeerId);
 
@@ -30,12 +29,12 @@ pub struct PlayerMarker;
 pub struct Score(pub usize);
 
 #[derive(Component, Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Reflect)]
-pub struct ColorComponent(pub(crate) Color);
+pub struct ColorComponent(pub Color);
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BulletMarker;
 
-// Inputs
+// ============ Inputs ============
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash, Reflect)]
 pub enum PlayerActions {
@@ -48,7 +47,6 @@ pub enum PlayerActions {
 }
 
 impl Actionlike for PlayerActions {
-    // Record what kind of inputs make sense for each action.
     fn input_control_kind(&self) -> InputControlKind {
         match self {
             Self::MoveCursor => InputControlKind::DualAxis,
@@ -57,22 +55,21 @@ impl Actionlike for PlayerActions {
     }
 }
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// ============ Protocol Plugin ============
+
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
-        // Use new input plugin path and default config
+        // Leafwing input plugin with lag compensation
         app.add_plugins(leafwing::InputPlugin::<PlayerActions> {
-            config: InputConfig::<PlayerActions> {
-                // enable lag compensation; the input messages sent to the server will include the
-                // interpolation delay of that client
+            config: lightyear::input::prelude::InputConfig::<PlayerActions> {
                 lag_compensation: true,
                 ..default()
             },
         });
-        // components
+        
+        // Components
         app.register_component::<Name>();
         app.register_component::<PlayerId>();
         app.register_component::<PlayerMarker>();
@@ -80,8 +77,6 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Position>()
             .add_prediction()
             .add_linear_interpolation()
-            // we enable correction without applying Correction on Position.
-            // Instead we will apply Correction/FrameInterpolation on Transform directly.
             .enable_correction();
 
         app.register_component::<Rotation>()
@@ -90,15 +85,10 @@ impl Plugin for ProtocolPlugin {
             .enable_correction();
 
         app.register_component::<ColorComponent>();
-
         app.register_component::<Score>();
-
         app.register_component::<RigidBody>();
-
         app.register_component::<BulletMarker>();
-
         app.register_component::<PredictedBot>();
-
         app.register_component::<InterpolatedBot>();
     }
 }

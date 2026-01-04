@@ -1,541 +1,216 @@
-use crate::client::ExampleClientPlugin;
+//! Server for projectiles with multi-transport support
+
 use crate::protocol::*;
-use crate::shared;
-use crate::shared::{Rooms, SharedPlugin, color_from_id};
+use crate::shared::*;
 use avian2d::prelude::*;
-use bevy::input::InputPlugin;
 use bevy::prelude::*;
-use bevy::time::Stopwatch;
+use bevy_enhanced_input::prelude::Complete;
 use bevy_enhanced_input::EnhancedInputSystems;
-use bevy_enhanced_input::prelude::*;
-use core::net::SocketAddr;
-use core::ops::DerefMut;
+use core::net::{Ipv4Addr, SocketAddr};
 use core::time::Duration;
-use leafwing_input_manager::prelude::*;
-use lightyear::connection::client::PeerMetadata;
-use lightyear::core::tick::TickDuration;
-use lightyear::crossbeam::CrossbeamIo;
-use lightyear::input::config::InputConfig;
-use lightyear::input::server::ServerInputConfig;
-use lightyear::interpolation::plugin::InterpolationDelay;
-use lightyear::netcode::NetcodeClient;
-use lightyear::prelude::server::*;
+use lightyear::connection::client::Connected;
+use lightyear::connection::server::Started;
+use lightyear::link::prelude::ViaTransport;
 use lightyear::prelude::*;
-use lightyear_avian2d::prelude::{
-    LagCompensationHistory, LagCompensationPlugin, LagCompensationSpatialQuery,
-};
-use lightyear_examples_common::cli::new_headless_app;
-use lightyear_examples_common::shared::{SEND_INTERVAL, SERVER_ADDR, SHARED_SETTINGS};
-use rand::random;
+use lightyear::prelude::server::*;
+use lightyear_avian2d::prelude::LagCompensationPlugin;
+use std::collections::HashMap;
+
+pub fn run_server() {
+    let mut app = App::new();
+
+    app.add_plugins(MinimalPlugins.set(bevy::app::ScheduleRunnerPlugin::run_loop(
+        Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    )));
+    app.add_plugins(bevy::log::LogPlugin::default());
+
+    // Lightyear server plugin
+    app.add_plugins(lightyear::prelude::server::ServerPlugins {
+        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    });
+
+    // Shared protocol + physics
+    app.add_plugins(SharedPlugin);
+
+    // Lag compensation for hit detection
+    app.add_plugins(LagCompensationPlugin);
+
+    // Server-specific plugin
+    app.add_plugins(ExampleServerPlugin);
+
+    app.run();
+}
 
 pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(RoomPlugin);
-        app.init_resource::<Rooms>();
-
-        app.add_plugins(LagCompensationPlugin);
+        app.init_resource::<PlayerRegistry>();
+        app.add_systems(Startup, startup);
         app.add_observer(handle_new_client);
-        app.add_observer(spawn_player);
-        app.add_observer(cycle_replication_mode);
-        app.add_observer(cycle_projectile_mode);
+        app.add_observer(handle_connected);
+        app.add_observer(handle_disconnected);
         app.add_observer(cycle_weapon_type);
         app.add_observer(handle_hits);
-
-        app.add_systems(Startup, spawn_global_control);
-
-        // we don't want to panic when trying to read the InputReader if gui is not enabled
+        
+        // Disable BEI input reading on server (we receive inputs from clients)
         app.configure_sets(PreUpdate, EnhancedInputSystems::Prepare.run_if(|| false));
-        app.add_plugins(bot::BotPlugin);
     }
 }
 
-pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
-    info!(
-        "Adding ReplicationSender to new ClientOf entity: {:?}",
-        trigger.entity
-    );
-    commands.entity(trigger.entity).insert((
-        ReplicationSender::new(SEND_INTERVAL, SendUpdatesMode::SinceLastAck, false),
-        // We need a ReplicationReceiver on the server side because the Action entities are spawned
-        // on the client and replicated to the server.
-        ReplicationReceiver::default(),
-        Name::from("ClientOf"),
-    ));
+#[derive(Resource, Default)]
+struct PlayerRegistry {
+    next_id: u64,
+    client_to_player: HashMap<Entity, Entity>,
 }
 
-pub(crate) fn spawn_global_control(mut commands: Commands) {
+fn startup(mut commands: Commands) {
+    info!("\n=== Multi-Transport Projectiles Server Starting ===\n");
+
+    // 1. Spawn ONE logical server
+    let server = commands
+        .spawn((Server::default(), Name::new("Server")))
+        .id();
+
+    // 2. UDP transport
+    let udp_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_UDP_PORT);
+    let udp_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(udp_addr),
+            ServerUdpIo::default(),
+            TransportOf::new(server),
+            Name::new("UdpTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: udp_transport });
+    info!("📡 UDP transport on port {}", SERVER_UDP_PORT);
+
+    // 3. WebTransport transport
+    let wt_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_WEBTRANSPORT_PORT);
+    let sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let identity = Identity::self_signed(sans).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    info!("🔐 WebTransport certificate digest: {}", digest);
+    
+    let wt_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(wt_addr),
+            WebTransportServerIo { certificate: identity },
+            TransportOf::new(server),
+            Name::new("WebTransportTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: wt_transport });
+    info!("🌐 WebTransport transport on port {}", SERVER_WEBTRANSPORT_PORT);
+
+    // 4. WebSocket transport
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_WEBSOCKET_PORT);
+    let ws_sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(ws_sans).unwrap());
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("🔌 WebSocket transport on port {}", SERVER_WEBSOCKET_PORT);
+
+    // Mark server as started
+    commands.entity(server).insert(Started);
+
+    // Spawn global context for weapon type
     commands.spawn((
         ClientContext,
         Replicate::to_clients(NetworkTarget::All),
-        GameReplicationMode::default(),
-        ProjectileReplicationMode::default(),
         WeaponType::default(),
         Name::new("ClientContext"),
     ));
+
+    info!("\n=== Projectiles Server Ready ===\n");
 }
 
-// Replicate the pre-spawned entities back to the client
-// We have to use `InitialReplicated` instead of `Replicated`, because
-// the server has already assumed authority over the entity so the `Replicated` component
-// has been removed
-pub(crate) fn spawn_player(
+fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    commands.entity(trigger.entity).insert((
+        ReplicationSender::new(SERVER_REPLICATION_INTERVAL, SendUpdatesMode::SinceLastAck, false),
+        ReplicationReceiver::default(),
+        Name::from("ClientLink"),
+    ));
+    info!("🔗 New client link: {:?}", trigger.entity);
+}
+
+fn handle_connected(
     trigger: On<Add, Connected>,
-    query: Query<(&RemoteId, Has<bot::BotClient>), With<ClientOf>>,
+    client_query: Query<(&RemoteId, &ViaTransport), With<ClientOf>>,
+    transport_names: Query<&Name>,
     mut commands: Commands,
-    mut rooms: ResMut<Rooms>,
-    replicated_players: Query<
-        (Entity, &InitialReplicated),
-        (Added<InitialReplicated>, With<PlayerId>),
-    >,
+    mut registry: ResMut<PlayerRegistry>,
 ) {
-    let sender = trigger.entity;
-    let Ok((client_id, is_bot)) = query.get(sender) else {
+    let Ok((remote_id, via_transport)) = client_query.get(trigger.entity) else {
         return;
     };
-    let client_id = client_id.0;
-    info!("Spawning player with id: {}", client_id);
+    let client_id = remote_id.0;
+    
+    let transport_name = transport_names.get(via_transport.transport)
+        .map(|n| n.as_str())
+        .unwrap_or("Unknown");
 
-    for i in 0..6 {
-        let replication_mode = GameReplicationMode::from_room_id(i);
-        let room = *rooms.rooms.entry(replication_mode).or_insert_with(|| {
-            commands
-                .spawn((
-                    Room::default(),
-                    Name::new(format!("Room{}", replication_mode.name())),
-                ))
-                .id()
-        });
-
-        // start by adding the player to the first room
-        if i == 0 {
-            commands.trigger(RoomEvent {
-                target: RoomTarget::AddSender(trigger.entity),
-                room,
-            });
-        }
-        let player = server_player_bundle(room, client_id, sender, replication_mode);
-        let player_entity = match replication_mode {
-            GameReplicationMode::AllPredicted => {
-                commands.spawn((player, PredictionTarget::to_clients(NetworkTarget::All)))
-            }
-            GameReplicationMode::ClientPredictedNoComp => commands.spawn((
-                player,
-                PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
-                InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
-                // we don't want to add RigidBody to the Interpolation target because that
-                // will add Position::default()/Rotation::default() via RequiredComponents.
-                ComponentReplicationOverrides::<RigidBody>::default()
-                    .disable_all()
-                    .enable_for(sender),
-            )),
-            GameReplicationMode::ClientPredictedLagComp => commands.spawn((
-                player,
-                PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
-                InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
-                // we don't want to add RigidBody to the Interpolation target because that
-                // will add Position::default()/Rotation::default() via RequiredComponents.
-                ComponentReplicationOverrides::<RigidBody>::default()
-                    .disable_all()
-                    .enable_for(sender),
-                // add the component to make lag-compensation possible!
-                LagCompensationHistory::default(),
-            )),
-            GameReplicationMode::ClientSideHitDetection => commands.spawn((
-                player,
-                PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
-                InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
-                // we don't want to add RigidBody to the Interpolation target because that
-                // will add Position::default()/Rotation::default() via RequiredComponents.
-                ComponentReplicationOverrides::<RigidBody>::default()
-                    .disable_all()
-                    .enable_for(sender),
-            )),
-            GameReplicationMode::AllInterpolated => {
-                commands.spawn((
-                    player,
-                    InterpolationTarget::to_clients(NetworkTarget::All),
-                    // we don't want to add RigidBody to the Interpolation target because that
-                    // will add Position::default()/Rotation::default() via RequiredComponents.
-                    // that means the entity will be in the middle of the screen until Position/Rotation are added
-                    ComponentReplicationOverrides::<RigidBody>::default().disable_all(),
-                ))
-            }
-            GameReplicationMode::OnlyInputsReplicated => commands.spawn((
-                PlayerContext,
-                replication_mode,
-                Replicate::to_clients(NetworkTarget::All),
-                NetworkVisibility::default(),
-                ControlledBy {
-                    owner: sender,
-                    lifetime: Default::default(),
-                },
-                PlayerMarker,
-                PlayerId(client_id),
-                Name::new("Player"),
-            )),
-        }
+    let player_entity = commands
+        .spawn((
+            player_bundle(client_id),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
+            },
+            Name::new(format!("Player_{}", registry.next_id)),
+        ))
         .id();
-        if is_bot {
-            commands.entity(player_entity).insert(Bot);
-        }
-        info!("Spawning player {player_entity:?} for room: {room:?}");
-        commands.trigger(RoomEvent {
-            target: RoomTarget::AddEntity(player_entity),
-            room,
-        });
+
+    registry.next_id += 1;
+    registry.client_to_player.insert(trigger.entity, player_entity);
+    
+    info!("🎮 Client {:?} connected via {} - spawned player {:?}", 
+          client_id, transport_name, player_entity);
+}
+
+fn handle_disconnected(
+    trigger: On<Add, Disconnected>,
+    mut commands: Commands,
+    mut registry: ResMut<PlayerRegistry>,
+) {
+    if let Some(player_entity) = registry.client_to_player.remove(&trigger.entity) {
+        info!("👋 Client disconnected, despawning player {:?}", player_entity);
+        commands.entity(player_entity).despawn();
     }
 }
 
-fn server_player_bundle(
-    room: Entity,
-    client_id: PeerId,
-    owner: Entity,
-    replication_mode: GameReplicationMode,
-) -> impl Bundle {
-    let bundle = shared::player_bundle(client_id, replication_mode);
-    (
-        Replicate::to_clients(NetworkTarget::All),
-        NetworkVisibility::default(),
-        ControlledBy {
-            owner,
-            lifetime: Default::default(),
-        },
-        bundle,
-    )
+/// Handle weapon cycling
+fn cycle_weapon_type(
+    trigger: On<Complete<CycleWeapon>>,
+    mut global: Query<&mut WeaponType, With<ClientContext>>,
+) {
+    if let Ok(mut weapon_type) = global.single_mut() {
+        *weapon_type = weapon_type.next();
+        info!("Switched to weapon: {}", weapon_type.name());
+    }
 }
 
-/// Increment the score if the client told us about a detected hit.
-fn handle_hits(trigger: On<RemoteEvent<HitDetected>>, mut scores: Query<&mut Score>) {
-    // TODO: ideally we would also despawn the bullet, otherwise we will keep replicating data for it to clients
-    //  even though they have already despawned it!
+/// Handle hit detection events from clients
+fn handle_hits(
+    trigger: On<RemoteEvent<HitDetected>>,
+    mut scores: Query<&mut Score>,
+) {
     if let Ok(mut score) = scores.get_mut(trigger.trigger.shooter) {
-        info!(
-            ?trigger,
-            "Server received hit detection trigger from client!"
-        );
+        info!(?trigger, "Server received hit from client!");
         score.0 += 1;
     }
-}
-
-mod bot {
-    use super::*;
-    pub struct BotPlugin;
-
-    impl Plugin for BotPlugin {
-        fn build(&self, app: &mut App) {}
-
-        // run in `cleanup` because BEI finishes building in `finish`
-        fn cleanup(&self, app: &mut App) {
-            app.add_observer(spawn_bot_app);
-            app.add_systems(Startup, spawn_bots);
-        }
-    }
-
-    #[derive(Component)]
-    pub struct BotClient;
-
-    #[derive(Event)]
-    pub struct SpawnBot;
-
-    pub struct BotApp(App);
-
-    unsafe impl Send for BotApp {}
-    unsafe impl Sync for BotApp {}
-
-    impl BotApp {
-        fn run(&mut self) {
-            info_span!("bot").in_scope(|| {
-                self.0.run();
-            });
-        }
-    }
-
-    /// Spawn bots when the server starts
-    /// NOTE: this has to be done after `Plugin::finish()` so that BEI has finished building.
-    pub(crate) fn spawn_bots(mut commands: Commands) {
-        commands.trigger(SpawnBot);
-    }
-
-    /// On the server, we will create a second app to host a bot that is similar to a real client,
-    /// but their inputs are mocked
-    fn spawn_bot_app(
-        trigger: On<SpawnBot>,
-        tick_duration: Res<TickDuration>,
-        server: Single<Entity, With<Server>>,
-        mut commands: Commands,
-    ) {
-        info!("Spawning bot app");
-        let (crossbeam_client, crossbeam_server) = CrossbeamIo::new_pair();
-
-        let mut app = new_headless_app();
-        // TODO: just spawn a bot player entity without creating a new client
-        // cannot use headless app because the frame rate is too fast so
-        // the bot sends too many packets
-        // let mut app = new_gui_app(false);
-        app.add_plugins(InputPlugin);
-        app.add_plugins(lightyear::prelude::client::ClientPlugins {
-            tick_duration: tick_duration.0,
-        });
-        app.add_plugins(SharedPlugin);
-        app.add_plugins(ExampleClientPlugin);
-
-        let client_id = rand::random::<u64>();
-        let auth = Authentication::Manual {
-            server_addr: SERVER_ADDR,
-            client_id,
-            private_key: SHARED_SETTINGS.private_key,
-            protocol_id: SHARED_SETTINGS.protocol_id,
-        };
-
-        app.world_mut().spawn((
-            Client::default(),
-            BotClient,
-            ReplicationSender::new(SEND_INTERVAL, SendUpdatesMode::SinceLastAck, false),
-            ReplicationReceiver::default(),
-            NetcodeClient::new(
-                auth,
-                lightyear::netcode::client_plugin::NetcodeConfig::default(),
-            )
-            .unwrap(),
-            crossbeam_client,
-            PredictionManager::default(),
-            Name::from("BotClient"),
-        ));
-        let server = server.into_inner();
-        let conditioner = RecvLinkConditioner::new(LinkConditionerConfig::average_condition());
-        commands.spawn((
-            LinkOf { server },
-            Link::new(Some(conditioner)),
-            Linked,
-            ClientOf,
-            BotClient,
-            crossbeam_server,
-            ReplicationSender::default(),
-        ));
-
-        app.add_systems(Startup, bot_connect);
-        app.add_systems(FixedFirst, bot_inputs.run_if(not(is_in_rollback)));
-        app.add_systems(Update, bot_wait);
-        let mut bot_app = BotApp(app);
-        std::thread::spawn(move || {
-            bot_app.run();
-        });
-    }
-
-    fn bot_connect(bot: Single<Entity, (With<BotClient>, With<Client>)>, mut commands: Commands) {
-        let entity = bot.into_inner();
-        info!("Bot entity {entity:?} connecting to server");
-        commands.trigger(Connect { entity });
-    }
-
-    #[derive(Debug, Clone, Copy, Default)]
-    enum BotMovementMode {
-        #[default]
-        Strafing, // 200ms intervals
-        StraightLine, // 1s intervals
-    }
-
-    impl BotMovementMode {
-        fn interval(&self) -> f32 {
-            match self {
-                BotMovementMode::Strafing => 0.4,     // 400ms for strafing
-                BotMovementMode::StraightLine => 2.0, // 2s for straight line
-            }
-        }
-
-        fn name(&self) -> &'static str {
-            match self {
-                BotMovementMode::Strafing => "strafing",
-                BotMovementMode::StraightLine => "straight-line",
-            }
-        }
-    }
-
-    struct BotLocal {
-        mode_timer: Stopwatch,
-        key_timer: Stopwatch,
-        shoot_timer: Timer,
-        current_mode: BotMovementMode,
-        press_a: bool,
-        override_direction: Option<bool>, // None = normal, Some(true) = force A, Some(false) = force D
-    }
-
-    impl Default for BotLocal {
-        fn default() -> Self {
-            BotLocal {
-                mode_timer: Default::default(),
-                key_timer: Default::default(),
-                shoot_timer: Timer::from_seconds(2.0, TimerMode::Repeating),
-                current_mode: Default::default(),
-                press_a: false,
-                override_direction: None,
-            }
-        }
-    }
-
-    fn bot_inputs(
-        time: Res<Time>,
-        mut input: ResMut<ButtonInput<KeyCode>>,
-        player: Single<&Position, (With<Controlled>, With<PlayerMarker>)>,
-        mut local: Local<BotLocal>,
-    ) {
-        let BotLocal {
-            mode_timer,
-            key_timer,
-            shoot_timer,
-            current_mode,
-            press_a,
-            override_direction,
-        } = local.deref_mut();
-
-        // If bot is too far from x = 0, override direction
-        let threshold = 500.0;
-        let pos_x = player.x;
-        if pos_x.abs() > threshold {
-            // If too far right, press A; if too far left, press D
-            *override_direction = Some(pos_x > 0.0);
-        } else if override_direction.is_some() && pos_x.abs() <= threshold * 0.8 {
-            // If bot is close enough to center, resume normal strafing
-            *override_direction = None;
-        }
-
-        mode_timer.tick(time.delta());
-        key_timer.tick(time.delta());
-        shoot_timer.tick(time.delta());
-
-        // we use press-space to make sure that we press the button long enough for it to be captured in FixedUpdate
-        if shoot_timer.is_finished() {
-            input.press(KeyCode::Space);
-        } else {
-            input.release(KeyCode::Space);
-        }
-
-        // Switch modes every 4 seconds
-        if mode_timer.elapsed_secs() >= 8.0 {
-            mode_timer.reset();
-            *current_mode = match *current_mode {
-                BotMovementMode::Strafing => BotMovementMode::StraightLine,
-                BotMovementMode::StraightLine => BotMovementMode::Strafing,
-            };
-            trace!("Bot switching to {} mode", current_mode.name());
-        }
-
-        // Switch keys based on the current mode's interval
-        if key_timer.elapsed_secs() >= current_mode.interval() {
-            key_timer.reset();
-            if *press_a {
-                input.release(KeyCode::KeyA);
-            } else {
-                input.release(KeyCode::KeyD);
-            }
-            *press_a = !*press_a;
-        }
-
-        // Decide which key to press
-        let press_a_now = match *override_direction {
-            Some(true) => true,   // Press A to move left
-            Some(false) => false, // Press D to move right
-            None => *press_a,
-        };
-
-        // Press the current key
-        if press_a_now {
-            input.press(KeyCode::KeyA);
-            input.release(KeyCode::KeyD);
-        } else {
-            input.press(KeyCode::KeyD);
-            input.release(KeyCode::KeyA);
-        }
-        trace!(
-            "Bot in {} mode, pressing {:?}",
-            current_mode.name(),
-            input.get_pressed().collect::<Vec<_>>()
-        );
-    }
-
-    // prevent the bot from running too fast
-    fn bot_wait(timeline: Res<LocalTimeline>) {
-        std::thread::sleep(Duration::from_millis(15));
-    }
-}
-
-/// Handle room switching when replication mode changes
-pub fn cycle_replication_mode(
-    trigger: On<Complete<CycleReplicationMode>>,
-    global: Single<&mut GameReplicationMode, With<ClientContext>>,
-    rooms: Res<Rooms>,
-    mut input_config: ResMut<ServerInputConfig<PlayerContext>>,
-    clients: Query<Entity, With<ClientOf>>,
-    room: Query<&Room>,
-    mut commands: Commands,
-) {
-    let mut replication_mode = global.into_inner();
-    let current_mode = *replication_mode;
-    *replication_mode = replication_mode.next();
-
-    // only rebroadcast if clients predict other clients
-    match replication_mode.as_ref() {
-        GameReplicationMode::AllPredicted | GameReplicationMode::OnlyInputsReplicated => {
-            info!("Setting rebroadcast inputs to True");
-            input_config.rebroadcast_inputs = true;
-        }
-        _ => {
-            info!("Setting rebroadcast inputs to False");
-            input_config.rebroadcast_inputs = false;
-        }
-    }
-
-    // Move all clients from current room to next room
-    if let (Some(current_room), Some(next_room)) = (
-        rooms.rooms.get(&current_mode),
-        rooms.rooms.get(&*replication_mode),
-    ) {
-        // also manually remove the Actions of the players present in the existing room
-        // (otherwise we might still be sending input messages for those actions even though the clients
-        //  have despawned the corresponding player entities)
-        if let Ok(room) = room.get(*current_room) {
-            room.entities.iter().for_each(|player| {
-                commands
-                    .entity(*player)
-                    .despawn_related::<Actions<PlayerContext>>();
-            })
-        }
-        for client_entity in clients.iter() {
-            commands.trigger(RoomEvent {
-                target: RoomTarget::RemoveSender(client_entity),
-                room: *current_room,
-            });
-            commands.trigger(RoomEvent {
-                target: RoomTarget::AddSender(client_entity),
-                room: *next_room,
-            });
-            info!(
-                "Switching client {client_entity:?} from room {current_room:?} to room {next_room:?}"
-            );
-        }
-    }
-
-    info!("Cycled to replication mode: {}", replication_mode.name());
-}
-
-/// Handle cycling through projectile replication modes
-pub fn cycle_projectile_mode(
-    trigger: On<Complete<CycleProjectileMode>>,
-    global: Single<&mut ProjectileReplicationMode, With<ClientContext>>,
-) {
-    let mut projectile_mode = global.into_inner();
-    *projectile_mode = projectile_mode.next();
-    info!("Cycled to projectile mode: {}", projectile_mode.name());
-}
-
-/// Handle weapon cycling input
-pub(crate) fn cycle_weapon_type(
-    trigger: On<Complete<CycleWeapon>>,
-    global: Single<&mut WeaponType, With<ClientContext>>,
-) {
-    let mut weapon_type = global.into_inner();
-    *weapon_type = weapon_type.next();
-    info!("Switched to weapon: {}", weapon_type.name());
 }

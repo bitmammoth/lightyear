@@ -1,211 +1,166 @@
-use core::f32::consts::TAU;
-
-use avian3d::prelude::*;
-use bevy::color::palettes::css;
-use bevy::math::VectorSpace;
-use bevy::platform::collections::HashMap;
-use bevy::prelude::*;
-use bevy::time::common_conditions::on_timer;
-use core::time::Duration;
-use leafwing_input_manager::prelude::*;
-use lightyear::connection::client::Connected;
-use lightyear::prelude::server::*;
-use lightyear::prelude::*;
-use lightyear_examples_common::shared::SEND_INTERVAL;
+//! Server implementation with multi-transport support and avian3d physics
 
 use crate::protocol::*;
-use crate::shared;
-use crate::shared::apply_character_action;
-use crate::shared::BlockPhysicsBundle;
-use crate::shared::CharacterPhysicsBundle;
-use crate::shared::FloorPhysicsBundle;
-use crate::shared::CHARACTER_CAPSULE_HEIGHT;
-use crate::shared::CHARACTER_CAPSULE_RADIUS;
-use crate::shared::FLOOR_HEIGHT;
-use crate::shared::FLOOR_WIDTH;
+use crate::shared::*;
+use avian3d::prelude::*;
+use bevy::prelude::*;
+use core::net::{Ipv4Addr, SocketAddr};
+use core::time::Duration;
+use leafwing_input_manager::prelude::ActionState;
+use lightyear::connection::client::Connected;
+use lightyear::connection::server::Started;
+use lightyear::link::prelude::ViaTransport;
+use lightyear::prelude::server::*;
+use lightyear::prelude::*;
+use std::collections::HashMap;
 
-#[derive(Clone)]
+pub fn run_server() {
+    let mut app = App::new();
+    
+    app.add_plugins(MinimalPlugins.set(bevy::app::ScheduleRunnerPlugin::run_loop(
+        Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    )));
+    app.add_plugins(bevy::log::LogPlugin::default());
+    
+    // Lightyear server plugin
+    app.add_plugins(lightyear::prelude::server::ServerPlugins {
+        tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+    });
+    
+    // Shared protocol + physics
+    app.add_plugins(SharedPlugin);
+    
+    // Server-specific plugin
+    app.add_plugins(ExampleServerPlugin);
+    
+    app.run();
+}
+
 pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup);
-        app.add_systems(
-            FixedUpdate,
-            (handle_character_actions, player_shoot, despawn_system),
-        );
+        app.init_resource::<PlayerRegistry>();
+        app.add_systems(Startup, startup);
         app.add_observer(handle_new_client);
         app.add_observer(handle_connected);
+        app.add_observer(handle_disconnected);
+        app.add_systems(FixedUpdate, movement);
     }
 }
 
-fn handle_character_actions(
-    time: Res<Time>,
-    spatial_query: SpatialQuery,
-    mut query: Query<(Entity, &ComputedMass, &ActionState<CharacterAction>, Forces)>,
-) {
-    for (entity, mass, action_state, forces) in &mut query {
-        apply_character_action(entity, mass, &time, &spatial_query, action_state, forces);
-    }
+#[derive(Resource, Default)]
+struct PlayerRegistry {
+    next_id: u64,
+    client_to_player: HashMap<Entity, Entity>,
 }
 
-#[derive(Component)]
-pub struct DespawnAfter {
-    spawned_at: f32,
-    lifetime: Duration,
-}
+fn startup(mut commands: Commands) {
+    info!("\n=== Multi-Transport Avian 3D Character Server Starting ===\n");
 
-fn despawn_system(
-    mut commands: Commands,
-    query: Query<(Entity, &DespawnAfter)>,
-    time: Res<Time<Fixed>>,
-) {
-    for (entity, despawn) in &query {
-        if time.elapsed_secs() - despawn.spawned_at >= despawn.lifetime.as_secs_f32() {
-            commands.entity(entity).despawn();
-        }
-    }
-}
+    // 1. Spawn ONE logical server
+    let server = commands
+        .spawn((Server::default(), Name::new("Server")))
+        .id();
 
-fn player_shoot(
-    mut commands: Commands,
-    timeline: Res<LocalTimeline>,
-    query: Query<(&ActionState<CharacterAction>, &Position, &ControlledBy), Without<Predicted>>,
-    time: Res<Time<Fixed>>,
-) {
-    for (action_state, position, controlled_by) in &query {
-        let mut position_override = ComponentReplicationOverrides::<Position>::default();
-        position_override.global_override(ComponentReplicationOverride {
-            replicate_once: true,
-            ..default()
-        });
-        let mut rotation_override = ComponentReplicationOverrides::<Rotation>::default();
-        rotation_override.global_override(ComponentReplicationOverride {
-            replicate_once: true,
-            ..default()
-        });
-        let mut linear_velocity_override =
-            ComponentReplicationOverrides::<LinearVelocity>::default();
-        linear_velocity_override.global_override(ComponentReplicationOverride {
-            replicate_once: true,
-            ..default()
-        });
-        let mut angular_velocity_override =
-            ComponentReplicationOverrides::<AngularVelocity>::default();
-        angular_velocity_override.global_override(ComponentReplicationOverride {
-            replicate_once: true,
-            ..default()
-        });
-        let mut computed_mass_override = ComponentReplicationOverrides::<ComputedMass>::default();
-        computed_mass_override.global_override(ComponentReplicationOverride {
-            replicate_once: true,
-            ..default()
-        });
+    // 2. UDP transport
+    let udp_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_UDP_PORT);
+    let udp_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(udp_addr),
+            ServerUdpIo::default(),
+            TransportOf::new(server),
+            Name::new("UdpTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: udp_transport });
+    info!("📡 UDP transport on port {}", SERVER_UDP_PORT);
 
-        if action_state.just_pressed(&CharacterAction::Shoot) {
-            commands.spawn((
-                Name::new("Projectile"),
-                ProjectileMarker,
-                DespawnAfter {
-                    spawned_at: time.elapsed_secs(),
-                    lifetime: Duration::from_millis(5000),
-                },
-                RigidBody::Dynamic,
-                *position, // Use current position
-                Rotation::default(),
-                LinearVelocity(Vec3::Z * 10.),
-                Replicate::to_clients(NetworkTarget::All),
-                PredictionTarget::to_clients(NetworkTarget::All),
-                ControlledBy {
-                    owner: controlled_by.owner,
-                    lifetime: Default::default(),
-                },
-                // we don't want clients to receive any replication updates after the initial spawn
-                (
-                    position_override,
-                    rotation_override,
-                    linear_velocity_override,
-                    angular_velocity_override,
-                    computed_mass_override,
-                ),
-            ));
-        }
-    }
-}
+    // 3. WebTransport transport
+    let wt_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_WEBTRANSPORT_PORT);
+    let sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let identity = Identity::self_signed(sans).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    info!("🔐 WebTransport certificate digest: {}", digest);
+    
+    let wt_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(wt_addr),
+            WebTransportServerIo { certificate: identity },
+            TransportOf::new(server),
+            Name::new("WebTransportTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: wt_transport });
+    info!("🌐 WebTransport transport on port {}", SERVER_WEBTRANSPORT_PORT);
 
-// Renamed from init, removed start_server
-fn setup(mut commands: Commands) {
+    // 4. WebSocket transport
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), SERVER_WEBSOCKET_PORT);
+    let ws_sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(ws_sans).unwrap());
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("🔌 WebSocket transport on port {}", SERVER_WEBSOCKET_PORT);
+
+    // Mark server as started
+    commands.entity(server).insert(Started);
+
+    // Spawn floor
     commands.spawn((
-        Name::new("Floor"),
-        FloorPhysicsBundle::default(),
+        Position(Vec3::new(0.0, -FLOOR_HEIGHT / 2.0, 0.0)),
         FloorMarker,
-        Position::new(Vec3::ZERO),
-        Replicate::to_clients(NetworkTarget::All),
+        ColorComponent(Color::srgb(0.3, 0.3, 0.3)),
+        FloorPhysicsBundle::default(),
+        Name::from("Floor"),
     ));
 
-    commands.spawn((
-        Name::new("Block"),
-        BlockPhysicsBundle::default(),
-        BlockMarker,
-        Position::new(Vec3::new(1.0, 1.0, 0.0)),
-        Replicate::to_clients(NetworkTarget::All),
-        PredictionTarget::to_clients(NetworkTarget::All),
+    info!("\n=== Server Ready ===\n");
+}
+
+fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    commands.entity(trigger.entity).insert((
+        ReplicationSender::new(SERVER_REPLICATION_INTERVAL, SendUpdatesMode::SinceLastAck, false),
+        Name::from("ClientLink"),
     ));
+    info!("🔗 New client link: {:?}", trigger.entity);
 }
 
-/// Add the ReplicationSender component to new clients
-pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
-    commands
-        .entity(trigger.entity)
-        .insert(ReplicationSender::new(
-            SEND_INTERVAL,
-            SendUpdatesMode::SinceLastAck,
-            false,
-        ));
-}
-
-/// Spawn the player entity when a client connects
-pub(crate) fn handle_connected(
+fn handle_connected(
     trigger: On<Add, Connected>,
-    query: Query<&RemoteId, With<ClientOf>>,
+    client_query: Query<(&RemoteId, &ViaTransport), With<ClientOf>>,
+    transport_names: Query<&Name>,
     mut commands: Commands,
-    character_query: Query<Entity, With<CharacterMarker>>,
+    mut registry: ResMut<PlayerRegistry>,
 ) {
-    let Ok(client_id) = query.get(trigger.entity) else {
+    let Ok((remote_id, via_transport)) = client_query.get(trigger.entity) else {
         return;
     };
-    let client_id = client_id.0;
-    info!("Client connected with client-id {client_id:?}. Spawning character entity.");
+    let client_id = remote_id.0;
+    
+    let transport_name = transport_names.get(via_transport.transport)
+        .map(|n| n.as_str())
+        .unwrap_or("Unknown");
+    
+    let color = color_from_id(client_id);
+    let x = (client_id.to_bits() as f32 * 2.0) % 20.0 - 10.0;
 
-    // Track the number of characters to pick colors and starting positions.
-    let num_characters = character_query.iter().count();
-
-    // Pick color and position for player.
-    let available_colors = [
-        css::LIMEGREEN,
-        css::PINK,
-        css::YELLOW,
-        css::AQUA,
-        css::CRIMSON,
-        css::GOLD,
-        css::ORANGE_RED,
-        css::SILVER,
-        css::SALMON,
-        css::YELLOW_GREEN,
-        css::WHITE,
-        css::RED,
-    ];
-    let color = available_colors[num_characters % available_colors.len()];
-    let angle: f32 = num_characters as f32 * 5.0;
-    let x = 2.0 * angle.cos();
-    let z = 2.0 * angle.sin();
-
-    // Spawn the character with ActionState. The client will add their own InputMap.
-    let character = commands
+    let player_entity = commands
         .spawn((
-            Name::new("Character"),
-            ActionState::<CharacterAction>::default(),
-            Position(Vec3::new(x, 3.0, z)),
+            CharacterMarker,
+            Position(Vec3::new(x, 2.0, 0.0)),
+            ColorComponent(color),
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::All),
             ControlledBy {
@@ -213,10 +168,39 @@ pub(crate) fn handle_connected(
                 lifetime: Default::default(),
             },
             CharacterPhysicsBundle::default(),
-            ColorComponent(color.into()),
-            CharacterMarker,
+            Name::new(format!("Character_{}", registry.next_id)),
         ))
         .id();
 
-    info!("Created entity {character:?} for client {client_id:?}");
+    registry.next_id += 1;
+    registry.client_to_player.insert(trigger.entity, player_entity);
+    
+    info!("🎮 Client {:?} connected via {} - spawned character {:?}", 
+          client_id, transport_name, player_entity);
+}
+
+fn handle_disconnected(
+    trigger: On<Add, Disconnected>,
+    mut commands: Commands,
+    mut registry: ResMut<PlayerRegistry>,
+) {
+    if let Some(player_entity) = registry.client_to_player.remove(&trigger.entity) {
+        info!("👋 Client disconnected, despawning character {:?}", player_entity);
+        commands.entity(player_entity).despawn();
+    }
+}
+
+/// Server-side movement handler
+fn movement(
+    spatial_query: SpatialQuery,
+    mut query: Query<(
+        Entity,
+        &Position,
+        &mut LinearVelocity,
+        &ActionState<CharacterAction>,
+    )>,
+) {
+    for (entity, position, mut velocity, action) in query.iter_mut() {
+        apply_character_action(entity, &mut velocity, &spatial_query, action, position);
+    }
 }

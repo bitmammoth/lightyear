@@ -1,184 +1,186 @@
-//! The client plugin.
-//! The client will be responsible for:
-//! - connecting to the server at Startup
-//! - sending inputs to the server
-//! - applying inputs to the locally predicted player (for prediction to work, inputs have to be applied to both the
-//! predicted entity and the server entity)
-use async_compat::Compat;
-use core::net::SocketAddr;
-use core::str::FromStr;
+//! Client module - connects via auth backend to get ConnectToken.
+//!
+//! Flow:
+//! 1. Connect to TCP auth backend
+//! 2. Receive ConnectToken
+//! 3. Use token to connect to game server
 
+use async_compat::Compat;
 use bevy::prelude::*;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{block_on, IoTaskPool, Task};
-use bevy::time::common_conditions::on_timer;
-use core::time::Duration;
-use lightyear::connection::client::ClientState;
+use core::net::Ipv4Addr;
+use std::net::SocketAddr;
 use lightyear::netcode::{ConnectToken, CONNECT_TOKEN_BYTES};
 use lightyear::prelude::client::*;
 use lightyear::prelude::*;
+use lightyear::websocket::prelude::client::ClientConfig as WebSocketClientConfig;
 
-use crate::shared;
+use crate::shared::*;
 
-pub struct ExampleClientPlugin {
-    pub auth_backend_address: SocketAddr,
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Transport {
+    #[default]
+    Udp,
+    WebTransport,
+    WebSocket,
 }
+
+#[derive(Resource)]
+pub struct ClientConfig {
+    pub transport: Transport,
+    pub cert_digest: Option<String>,
+}
+
+pub struct ExampleClientPlugin;
 
 impl Plugin for ExampleClientPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ConnectTokenRequestTask {
-            auth_backend_addr: self.auth_backend_address,
-            task: None,
-        });
-
-        // despawn the existing connect button from the Renderer if it exists
-        // (because we want to replace it with one with specific behaviour)
-        // This might need adjustment if the common renderer changes significantly
-        if let Ok(button_entity) = app
-            .world_mut()
-            .query_filtered::<Entity, With<Button>>()
-            .single(app.world())
-        {
-            app.world_mut().despawn(button_entity);
-        }
-
-        app.add_systems(Startup, spawn_connect_button);
-        app.add_systems(Update, fetch_connect_token);
-        app.add_observer(on_disconnect);
+        app.insert_resource(ConnectTokenTask { task: None });
+        app.add_systems(Startup, (setup_camera, start_token_request));
+        app.add_systems(Update, poll_token_task);
     }
 }
 
-/// Holds a handle to an io task that is requesting a `ConnectToken` from the backend
+fn setup_camera(mut commands: Commands) {
+    commands.spawn(Camera2d);
+}
+
+/// Resource to hold the async task fetching the ConnectToken
 #[derive(Resource)]
-struct ConnectTokenRequestTask {
-    auth_backend_addr: SocketAddr,
+struct ConnectTokenTask {
     task: Option<Task<ConnectToken>>,
 }
 
-/// If we have an io task that is waiting for a `ConnectToken`, we poll the task until completion,
-/// then we retrieve the token and update the ClientConfig.
-fn fetch_connect_token(
-    mut connect_token_request: ResMut<ConnectTokenRequestTask>,
-    client: Single<Entity, With<Client>>,
+/// Start the async task to get a ConnectToken from the auth backend
+fn start_token_request(mut token_task: ResMut<ConnectTokenTask>) {
+    info!("🔐 Requesting ConnectToken from auth backend at {}", AUTH_BACKEND_ADDR);
+    
+    let task = IoTaskPool::get().spawn(Compat::new(async move {
+        get_connect_token_from_backend().await
+    }));
+    token_task.task = Some(task);
+}
+
+/// Poll the token task and connect when token is received
+fn poll_token_task(
+    mut token_task: ResMut<ConnectTokenTask>,
+    config: Res<ClientConfig>,
     mut commands: Commands,
+    existing_clients: Query<Entity, With<Client>>,
 ) -> Result {
-    if let Some(task) = &mut connect_token_request.task {
-        if let Some(connect_token) = block_on(future::poll_once(task)) {
-            info!("Received ConnectToken, starting connection!");
-            let client = client.into_inner();
-            commands.entity(client).insert(NetcodeClient::new(
-                Authentication::Token(connect_token),
-                NetcodeConfig::default(),
-            )?);
+    // Don't create multiple clients
+    if !existing_clients.is_empty() {
+        return Ok(());
+    }
+    
+    let Some(task) = &mut token_task.task else {
+        return Ok(());
+    };
+    
+    let Some(connect_token) = block_on(future::poll_once(task)) else {
+        return Ok(());
+    };
+    
+    info!("✅ Received ConnectToken, connecting to server...");
+    token_task.task = None;
+    
+    // Now create the client with the token
+    let client_port = 6000 + (rand::random::<u16>() % 100);
+    let client_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_port);
+    
+    match config.transport {
+        Transport::Udp => {
+            info!("📡 Connecting via UDP to {}", UDP_SERVER_ADDR);
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(UDP_SERVER_ADDR),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(
+                        Authentication::Token(connect_token),
+                        NetcodeConfig::default(),
+                    )?,
+                    UdpIo::default(),
+                    Name::new("UdpClient"),
+                ))
+                .id();
             commands.trigger(Connect { entity: client });
-            connect_token_request.task = None;
+        }
+        Transport::WebTransport => {
+            info!("🌐 Connecting via WebTransport to {}", WEBTRANSPORT_SERVER_ADDR);
+            let cert_digest = config.cert_digest.clone()
+                .expect("WebTransport requires cert_digest")
+                .replace(":", "");
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(WEBTRANSPORT_SERVER_ADDR),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(
+                        Authentication::Token(connect_token),
+                        NetcodeConfig::default(),
+                    )?,
+                    WebTransportClientIo {
+                        certificate_digest: cert_digest,
+                    },
+                    Name::new("WebTransportClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
+        }
+        Transport::WebSocket => {
+            info!("🔌 Connecting via WebSocket to {}", WEBSOCKET_SERVER_ADDR);
+            let client = commands
+                .spawn((
+                    Client::default(),
+                    LocalAddr(client_addr),
+                    PeerAddr(WEBSOCKET_SERVER_ADDR),
+                    Link::new(None),
+                    ReplicationReceiver::default(),
+                    NetcodeClient::new(
+                        Authentication::Token(connect_token),
+                        NetcodeConfig::default(),
+                    )?,
+                    WebSocketClientIo {
+                        config: WebSocketClientConfig::builder()
+                            .with_no_cert_validation(),
+                        scheme: WebSocketScheme::Secure,
+                    },
+                    Name::new("WebSocketClient"),
+                ))
+                .id();
+            commands.trigger(Connect { entity: client });
         }
     }
+    
     Ok(())
 }
 
-/// Component to identify the text displaying the client id
-#[derive(Component)]
-pub struct ClientIdText;
-
-/// Get a ConnectToken via a TCP connection to the authentication server
-async fn get_connect_token_from_auth_backend(auth_backend_address: SocketAddr) -> ConnectToken {
-    let stream = tokio::net::TcpStream::connect(auth_backend_address)
+/// Async function to get ConnectToken from TCP auth backend
+async fn get_connect_token_from_backend() -> ConnectToken {
+    let stream = tokio::net::TcpStream::connect(AUTH_BACKEND_ADDR)
         .await
-        .expect(
-            format!(
-                "Failed to connect to authentication server on {:?}",
-                auth_backend_address
-            )
-            .as_str(),
-        );
-    // wait for the socket to be readable
+        .expect(&format!("Failed to connect to auth backend at {}", AUTH_BACKEND_ADDR));
+    
     stream.readable().await.unwrap();
+    
     let mut buffer = [0u8; CONNECT_TOKEN_BYTES];
     match stream.try_read(&mut buffer) {
         Ok(n) if n == CONNECT_TOKEN_BYTES => {
-            trace!(
-                "Received token bytes: {:?}. Token len: {:?}",
-                buffer,
-                buffer.len()
-            );
+            info!("📥 Received {} bytes from auth backend", n);
             ConnectToken::try_from_bytes(&buffer)
-                .expect("Failed to parse token from authentication server")
+                .expect("Failed to parse ConnectToken")
         }
-        _ => {
-            panic!("Failed to read token from authentication server")
+        Ok(n) => {
+            panic!("Unexpected token size: {} bytes (expected {})", n, CONNECT_TOKEN_BYTES);
+        }
+        Err(e) => {
+            panic!("Failed to read token: {:?}", e);
         }
     }
-}
-
-/// Remove all entities when the client disconnect
-fn on_disconnect(
-    trigger: On<Insert, Disconnected>,
-    mut commands: Commands,
-    debug_text: Query<Entity, With<ClientIdText>>,
-) {
-    for entity in debug_text.iter() {
-        commands.entity(entity).despawn();
-    }
-}
-
-/// Create a button that allow you to connect/disconnect to a server
-/// When pressing Connect, we will start an asynchronous request via TCP to get a ConnectToken
-/// that can be used to connect
-pub(crate) fn spawn_connect_button(mut commands: Commands) {
-    commands.spawn(Camera2d);
-    commands
-        .spawn(Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            align_items: AlignItems::FlexEnd,
-            justify_content: JustifyContent::FlexEnd,
-            flex_direction: FlexDirection::Row,
-            ..default()
-        })
-        .with_children(|parent| {
-            parent
-                .spawn((
-                    Text("Connect".to_string()),
-                    TextColor(Color::srgb(0.9, 0.9, 0.9)),
-                    TextFont::from_font_size(20.0),
-                    BorderColor::all(Color::BLACK),
-                    Node {
-                        width: Val::Px(150.0),
-                        height: Val::Px(65.0),
-                        border: UiRect::all(Val::Px(5.0)),
-                        // horizontally center child text
-                        justify_content: JustifyContent::Center,
-                        // vertically center child text
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    Button,
-                ))
-                .observe(
-                    |trigger: On<Pointer<Click>>,
-                     mut commands: Commands,
-                     mut task_state: ResMut<ConnectTokenRequestTask>,
-                     client: Single<(Entity, &Client)>| {
-                        let (client_entity, client) = client.into_inner();
-                        match client.state {
-                            ClientState::Disconnected => {
-                                info!("Starting task to get ConnectToken");
-
-                                let auth_backend_addr = task_state.auth_backend_addr;
-                                let task = IoTaskPool::get().spawn_local(Compat::new(async move {
-                                    get_connect_token_from_auth_backend(auth_backend_addr).await
-                                }));
-                                task_state.task = Some(task);
-                            }
-                            _ => {
-                                info!("Disconnecting from server");
-                                commands.trigger(Disconnect {
-                                    entity: client_entity,
-                                });
-                            }
-                        };
-                    },
-                );
-        });
 }

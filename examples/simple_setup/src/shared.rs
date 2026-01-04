@@ -10,7 +10,10 @@ pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
 
 pub const SERVER_REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
-pub const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+/// Server addresses for each transport
+pub const UDP_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+pub const WT_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
+pub const WS_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002);
 
 #[derive(Clone)]
 pub struct SharedPlugin;

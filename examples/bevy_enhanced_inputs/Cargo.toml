@@ -1,53 +1,48 @@
 [package]
 name = "bevy_enhanced_inputs"
 version = "0.25.5"
-authors = ["Charles Bournhonesque <charlesbour@gmail.com>"]
-edition = "2021"
-description = "Examples for the lightyear networking library for the Bevy game engine"
-readme = "README.md"
-repository = "https://github.com/cBournhonesque/lightyear"
-keywords = ["bevy", "multiplayer", "networking", "netcode", "gamedev"]
-categories = ["game-development", "network-programming"]
-license = "MIT OR Apache-2.0"
+rust-version.workspace = true
+edition.workspace = true
 publish = false
 
 [features]
-default = ["client", "gui", "server", "netcode", "udp"]
-client = ["gui", "lightyear/client", "lightyear_examples_common/client"]
-gui = ["lightyear_examples_common/gui"]
-server = ["lightyear/server", "lightyear_examples_common/server"]
-netcode = ["lightyear_examples_common/netcode"]
-udp = [
-  "lightyear_examples_common/udp",
-  # udp requires std
-  "lightyear/std",
-  "lightyear/udp",
-]
-
+default = ["server", "client"]
+server = ["lightyear/server"]
+client = ["lightyear/client"]
 
 [dependencies]
-lightyear = { "workspace" = true, features = [
-  "interpolation",
-  "prediction",
-  "replication",
-  "input_bei",
+bevy = { workspace = true, features = [
+    "bevy_gizmos",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
+    "png",
+    "x11",
+] }
+lightyear = { path = "../../lightyear", features = [
+    "std",
+    "server",
+    "client",
+    "netcode",
+    "udp",
+    "webtransport",
+    "websocket",
+    "interpolation",
+    "prediction",
+    "replication",
+    "input_bei",
+    "debug",
 ] }
 bevy_enhanced_input.workspace = true
-lightyear_examples_common.workspace = true
-serde.workspace = true
-bevy.workspace = true
-
-[package.metadata.bevy_cli.web]
-rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
-default-features = false
-features = ["client", "netcode"]
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+rand.workspace = true
 
 [lints]
 workspace = true
-
-[lib]
-doc = false
-
-[[bin]]
-name = "bevy_enhanced_inputs"
-doc = false

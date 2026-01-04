@@ -393,17 +393,11 @@ impl<T: ReplicationTargetT> ReplicationTarget<T> {
         Self::new(ReplicationMode::SingleClient)
     }
 
+    /// Target all clients matching the NetworkTarget.
+    /// 
+    /// Works with both single-server and multi-transport setups.
     #[cfg(feature = "server")]
     pub fn to_clients(target: NetworkTarget) -> Self {
-        Self::new(ReplicationMode::SingleServer(target))
-    }
-
-    /// Target all clients matching the NetworkTarget, regardless of which server they're connected to.
-    /// 
-    /// This is useful for multi-transport setups where you want prediction/interpolation to work
-    /// across all transports (e.g., UDP + WebTransport).
-    #[cfg(feature = "server")]
-    pub fn to_all(target: NetworkTarget) -> Self {
         Self::new(ReplicationMode::Target(target))
     }
 
@@ -807,18 +801,29 @@ impl Replicate {
         }
     }
 
+    /// Replicate to all clients matching the target.
+    /// 
+    /// Works with both single-server and multi-transport setups.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // Spawn a player visible to all clients
+    /// commands.spawn((
+    ///     Player,
+    ///     Replicate::to_clients(NetworkTarget::All),
+    /// ));
+    /// ```
     #[cfg(feature = "server")]
     pub fn to_clients(target: NetworkTarget) -> Self {
         Self {
-            mode: ReplicationMode::SingleServer(target),
+            mode: ReplicationMode::Target(target),
         }
     }
 
     /// Replicate to clients connected through a specific server entity.
     /// 
     /// This is useful when running multiple server transports (e.g., UDP + WebTransport)
-    /// where each transport has its own Server entity. Unlike [`to_clients`](Self::to_clients),
-    /// which requires exactly one Server entity in the world, this method explicitly
+    /// where each transport has its own Server entity. This method explicitly
     /// specifies which server's clients to replicate to.
     /// 
     /// # Example
@@ -842,30 +847,6 @@ impl Replicate {
     pub fn to_clients_via(server: Entity, target: NetworkTarget) -> Self {
         Self {
             mode: ReplicationMode::Server(server, target),
-        }
-    }
-
-    /// Replicate to all clients matching the target, regardless of which server they're connected to.
-    /// 
-    /// This is the recommended mode for multi-transport setups where you want a unified game world
-    /// visible to all clients across all transports (e.g., UDP + WebTransport).
-    /// 
-    /// Unlike [`to_clients`](Self::to_clients) which requires a single Server entity,
-    /// and [`to_clients_via`](Self::to_clients_via) which replicates to one server's clients,
-    /// this mode replicates to ALL matching clients regardless of their transport.
-    /// 
-    /// # Example
-    /// ```ignore
-    /// // Spawn a player visible to all clients on all transports
-    /// commands.spawn((
-    ///     Player,
-    ///     Replicate::to_all(NetworkTarget::All),
-    /// ));
-    /// ```
-    #[cfg(feature = "server")]
-    pub fn to_all(target: NetworkTarget) -> Self {
-        Self {
-            mode: ReplicationMode::Target(target),
         }
     }
 

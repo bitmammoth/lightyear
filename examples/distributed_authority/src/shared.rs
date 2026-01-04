@@ -1,67 +1,88 @@
-//! This module contains the shared code between the client and the server.
+//! Shared code between client and server.
 //!
-//! The rendering code is here because you might want to run the example in host-server mode, where the server also acts as a client.
-//! The simulation logic (movement, etc.) should be shared between client and server to guarantee that there won't be
-//! mispredictions/rollbacks.
+//! Contains movement behaviors and helper functions that need to be identical
+//! on both sides for prediction to work correctly.
 
-// Added for color_from_id
 use bevy::prelude::*;
-use std::hash::Hash;
-// Added for PeerId hashing
-
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::time::Duration;
 use lightyear::prelude::*;
 
 use crate::protocol::*;
 
-#[derive(Clone)]
+// ============ Constants ============
+
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
+pub const SERVER_REPLICATION_INTERVAL: Duration = Duration::from_millis(100);
+pub const MOVE_SPEED: f32 = 10.0;
+
+pub const UDP_PORT: u16 = 5000;
+pub const WEBTRANSPORT_PORT: u16 = 5001;
+pub const WEBSOCKET_PORT: u16 = 5002;
+
+pub const UDP_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), UDP_PORT);
+pub const WEBTRANSPORT_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBTRANSPORT_PORT);
+pub const WEBSOCKET_SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), WEBSOCKET_PORT);
+
+// Distance threshold for authority transfer - when player is closer than this to ball
+pub const AUTHORITY_TRANSFER_DISTANCE: f32 = 100.0;
+
+// ============ Plugin ============
+
 pub struct SharedPlugin;
 
 impl Plugin for SharedPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ProtocolPlugin);
+        // Ball movement runs in FixedUpdate with authority check
         app.add_systems(FixedUpdate, ball_movement);
     }
 }
 
-// Generate pseudo-random color from id
-pub(crate) fn color_from_id(client_id: PeerId) -> Color {
+// ============ Shared Movement ============
+
+/// Generate pseudo-random color from PeerId
+pub fn color_from_id(client_id: PeerId) -> Color {
     let h = (((client_id.to_bits().wrapping_mul(80)) % 360) as f32) / 360.0;
     let s = 1.0;
     let l = 0.5;
     Color::hsl(h, s, l)
 }
 
-// This system defines how we update the player's positions when we receive an input
-pub(crate) fn shared_movement_behaviour(mut position: Mut<Position>, input: &Inputs) {
-    const MOVE_SPEED: f32 = 10.0;
-    let Inputs::Direction(direction) = input;
-    if direction.up {
-        position.y += MOVE_SPEED;
-    }
-    if direction.down {
-        position.y -= MOVE_SPEED;
-    }
-    if direction.left {
-        position.x -= MOVE_SPEED;
-    }
-    if direction.right {
-        position.x += MOVE_SPEED;
+/// Shared player movement behavior - used by both client (prediction) and server (authority)
+pub fn shared_movement_behaviour(mut position: Mut<Position>, input: &Inputs) {
+    if let Inputs::Direction(direction) = input {
+        if direction.up {
+            position.y += MOVE_SPEED;
+        }
+        if direction.down {
+            position.y -= MOVE_SPEED;
+        }
+        if direction.left {
+            position.x -= MOVE_SPEED;
+        }
+        if direction.right {
+            position.x += MOVE_SPEED;
+        }
     }
 }
 
-/// We move the ball only when we have authority over it.
+/// Ball movement - only runs when we have authority over the ball.
 ///
-/// The peer that has authority could be the Server, a Client or no one
-pub(crate) fn ball_movement(
+/// The peer with authority (Server or Client) runs this system.
+/// Other peers see interpolated updates.
+pub fn ball_movement(
     mut balls: Query<(&mut Position, &mut Speed), (With<BallMarker>, With<HasAuthority>)>,
 ) {
     for (mut position, mut speed) in balls.iter_mut() {
+        // Bounce at vertical bounds
         if position.y > 300.0 {
             speed.y = -1.0;
         }
         if position.y < -300.0 {
             speed.y = 1.0;
         }
+        // Apply velocity
         position.0 += speed.0;
     }
 }

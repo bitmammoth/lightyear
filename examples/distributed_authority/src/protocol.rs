@@ -1,102 +1,93 @@
-//! This file contains the shared [`Protocol`] that defines the messages that can be sent between the client and server.
+//! Protocol definitions for the distributed authority example.
 //!
-//! You will need to define the [`Components`], [`Messages`] and [`Inputs`] that make up the protocol.
-//! You can use the `#[protocol]` attribute to specify additional behaviour:
-//! - how entities contained in the message should be mapped from the remote world to the local world
-//! - how the component should be synchronized between the `Confirmed` entity and the `Predicted`/`Interpolated` entity
-use bevy::color::palettes;
+//! Components, inputs, and messages shared between client and server.
+
 use bevy::ecs::entity::MapEntities;
+use bevy::math::Curve;
 use bevy::prelude::*;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Reflect)]
+// ============ Components ============
+
+/// Unique identifier for each player - wraps PeerId to track owner
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Deref, DerefMut, Reflect)]
 pub struct PlayerId(pub PeerId);
 
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
+/// Position in 2D space - used for players and the ball
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Default, Deref, DerefMut, Reflect)]
 pub struct Position(pub Vec2);
 
 impl Ease for Position {
     fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
             Position(Vec2::lerp(start.0, end.0, t))
         })
     }
 }
 
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
+/// Velocity for the ball
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Default, Deref, DerefMut, Reflect)]
 pub struct Speed(pub Vec2);
 
-impl Ease for Speed {
-    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
-            Speed(Vec2::lerp(start.0, end.0, t))
-        })
-    }
-}
+/// Color for rendering
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlayerColor(pub Color);
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerColor(pub(crate) Color);
-
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
+/// Marker component for the ball entity
+#[derive(Component, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct BallMarker;
 
-// Inputs
+// ============ Inputs ============
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Reflect)]
+/// Direction input from players
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
 pub struct Direction {
-    pub(crate) up: bool,
-    pub(crate) down: bool,
-    pub(crate) left: bool,
-    pub(crate) right: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
 }
 
 impl Direction {
-    pub(crate) fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> bool {
         !self.up && !self.down && !self.left && !self.right
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect)]
+/// Input actions that can be sent to the server
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect, Default)]
 pub enum Inputs {
+    #[default]
+    None,
     Direction(Direction),
 }
 
-impl Default for Inputs {
-    fn default() -> Self {
-        Inputs::Direction(Direction {
-            up: false,
-            down: false,
-            left: false,
-            right: false,
-        })
-    }
-}
-
 impl MapEntities for Inputs {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, _entity_mapper: &mut M) {}
 }
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// ============ Protocol Plugin ============
+
+/// Registers all protocol components, inputs, and channels
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
-        app.add_plugins(input::native::InputPlugin::<Inputs>::default());
-        // components
+        // Components - basic replication
         app.register_component::<PlayerId>();
-
+        app.register_component::<PlayerColor>();
         app.register_component::<BallMarker>();
-
+        
+        // Position with prediction and linear interpolation
         app.register_component::<Position>()
             .add_prediction()
             .add_linear_interpolation();
-
-        app.register_component::<Speed>()
-            .add_prediction()
-            .add_linear_interpolation();
-
-        app.register_component::<PlayerColor>();
+        
+        // Speed - replicated but not interpolated
+        app.register_component::<Speed>();
+        
+        // Register inputs
+        app.add_plugins(lightyear::prelude::input::native::InputPlugin::<Inputs>::default());
     }
 }

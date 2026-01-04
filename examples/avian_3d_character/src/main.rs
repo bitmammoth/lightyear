@@ -1,73 +1,75 @@
+//! Multi-Transport Avian 3D Character Example
+//!
+//! Demonstrates 3D character physics with avian3d across multiple transports.
+//! Players control capsule characters in a 3D arena with jumping and movement.
+//!
+//! Run with:
+//! - `cargo run -- server`
+//! - `cargo run -- client --transport udp`
+//! - `cargo run -- client --transport webtransport --cert <DIGEST>`
+//! - `cargo run -- client --transport websocket`
+
 #![allow(unused_imports)]
-#![allow(unused_variables)]
 #![allow(dead_code)]
+
 use bevy::prelude::*;
-use core::time::Duration;
+use clap::{Parser, Subcommand, ValueEnum};
 
-use lightyear::prelude::{Client, InputTimeline, Timeline};
-use lightyear_examples_common::cli::{Cli, Mode};
-use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
-
-#[cfg(feature = "client")]
-use crate::client::ExampleClientPlugin;
-#[cfg(feature = "server")]
-use crate::server::ExampleServerPlugin;
-use crate::shared::SharedPlugin;
 #[cfg(feature = "client")]
 mod client;
 mod protocol;
-#[cfg(feature = "gui")]
-mod renderer;
-#[cfg(feature = "server")]
 mod server;
 mod shared;
 
-fn main() {
-    let cli = Cli::default();
+#[cfg(feature = "client")]
+use client::run_client;
+use server::run_server;
 
-    let mut app = cli.build_app(Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ), true);
-
-    app.add_plugins(SharedPlugin);
-
-    cli.spawn_connections(&mut app);
-
-    match cli.mode {
-        #[cfg(feature = "client")]
-        Some(Mode::Client { .. }) => {
-            app.add_plugins(ExampleClientPlugin);
-            add_input_delay(&mut app);
-        }
-        #[cfg(feature = "server")]
-        Some(Mode::Server) => {
-            app.add_plugins(ExampleServerPlugin);
-        }
-        #[cfg(all(feature = "client", feature = "server"))]
-        Some(Mode::HostClient { client_id }) => {
-            app.add_plugins(ExampleClientPlugin);
-            app.add_plugins(ExampleServerPlugin);
-            add_input_delay(&mut app);
-        }
-        _ => {}
-    }
-
-    #[cfg(feature = "gui")]
-    app.add_plugins(renderer::ExampleRendererPlugin);
-
-    app.run();
+#[derive(Parser)]
+#[command(name = "avian_3d_character")]
+#[command(about = "Multi-transport 3D character physics demo with avian3d")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-#[cfg(feature = "client")]
-fn add_input_delay(app: &mut App) {
-    use lightyear::prelude::client::{InputDelayConfig, InputTimelineConfig};
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the server (listens on UDP:5000, WebTransport:5001, WebSocket:5002)
+    Server,
+    /// Run a client
+    Client {
+        /// Transport protocol to use
+        #[arg(short, long, default_value = "udp")]
+        transport: TransportArg,
+        /// Certificate digest (required for WebTransport)
+        #[arg(short, long)]
+        cert: Option<String>,
+    },
+}
 
-    let client = app
-        .world_mut()
-        .query_filtered::<Entity, With<Client>>()
-        .single(app.world_mut())
-        .unwrap();
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum, Default)]
+pub enum TransportArg {
+    #[default]
+    Udp,
+    Webtransport,
+    Websocket,
+}
 
-    // set some input-delay since we are predicting all entities
-    app.world_mut().entity_mut(client).insert(
-        InputTimelineConfig::default().with_input_delay(InputDelayConfig::fixed_input_delay(0)),
-    );
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Server => {
+            run_server();
+        }
+        #[cfg(feature = "client")]
+        Commands::Client { transport, cert } => {
+            run_client(transport, cert);
+        }
+        #[cfg(not(feature = "client"))]
+        Commands::Client { .. } => {
+            eprintln!("Client feature not enabled. Compile with --features client");
+        }
+    }
 }

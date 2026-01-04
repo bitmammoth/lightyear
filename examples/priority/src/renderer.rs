@@ -1,64 +1,72 @@
-use crate::protocol::*;
-use bevy::color::palettes::basic::{BLUE, GREEN, RED};
+//! Rendering code for visualizing shapes and players.
+
 use bevy::prelude::*;
 
-#[derive(Clone)]
+use crate::protocol::*;
+
+// ============ Plugin ============
+
 pub struct ExampleRendererPlugin;
 
 impl Plugin for ExampleRendererPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, init);
-        app.add_systems(Update, (draw_players, draw_props));
+        app.add_systems(Startup, setup_camera);
+        app.add_systems(Update, (draw_shapes, draw_players));
     }
 }
 
-fn init(mut commands: Commands) {
+fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-/// System that draws the player
-/// The components should be replicated from the server to the client
-/// This time we will only draw the predicted/interpolated entities
-pub(crate) fn draw_players(mut gizmos: Gizmos, players: Query<(&Position, &PlayerColor)>) {
-    for (position, color) in &players {
-        gizmos.rect(
-            Isometry3d::from_translation(Vec3::new(position.x, position.y, 0.0)),
-            Vec2::ONE * 50.0,
-            color.0,
-        );
-    }
-}
-
-/// System that draws the props
-pub(crate) fn draw_props(mut gizmos: Gizmos, props: Query<(&Position, &Shape)>) {
-    for (position, shape) in props.iter() {
+/// Draw shapes in the grid
+fn draw_shapes(
+    mut gizmos: Gizmos,
+    shapes: Query<(&Position, &Shape)>,
+) {
+    for (pos, shape) in shapes.iter() {
+        let color = Color::srgba(0.5, 0.5, 0.5, 0.8);
+        let size = 8.0;
+        
         match shape {
             Shape::Circle => {
                 gizmos.circle_2d(
-                    Isometry2d::from_translation(position.0),
-                    crate::shared::PROP_SIZE,
-                    GREEN,
+                    Isometry2d::from_translation(pos.0),
+                    size,
+                    color,
                 );
             }
             Shape::Triangle => {
-                gizmos.linestrip_2d(
-                    vec![
-                        position.0 + Vec2::new(0.0, crate::shared::PROP_SIZE),
-                        position.0 + Vec2::new(crate::shared::PROP_SIZE, -crate::shared::PROP_SIZE),
-                        position.0
-                            + Vec2::new(-crate::shared::PROP_SIZE, -crate::shared::PROP_SIZE),
-                        position.0 + Vec2::new(0.0, crate::shared::PROP_SIZE),
-                    ],
-                    RED,
-                );
+                // Draw triangle using lines
+                let offset = size;
+                let p1 = pos.0 + Vec2::new(0.0, offset);
+                let p2 = pos.0 + Vec2::new(-offset * 0.866, -offset * 0.5);
+                let p3 = pos.0 + Vec2::new(offset * 0.866, -offset * 0.5);
+                gizmos.line_2d(p1, p2, color);
+                gizmos.line_2d(p2, p3, color);
+                gizmos.line_2d(p3, p1, color);
             }
             Shape::Square => {
                 gizmos.rect_2d(
-                    Isometry2d::from_translation(position.0),
-                    Vec2::splat(crate::shared::PROP_SIZE * 2.0),
-                    BLUE,
+                    Isometry2d::from_translation(pos.0),
+                    Vec2::splat(size * 2.0),
+                    color,
                 );
             }
         }
+    }
+}
+
+/// Draw player boxes
+fn draw_players(
+    mut gizmos: Gizmos,
+    players: Query<(&PlayerPosition, &PlayerColor)>,
+) {
+    for (pos, color) in players.iter() {
+        gizmos.rect_2d(
+            Isometry2d::from_translation(pos.0),
+            Vec2::splat(30.0),
+            color.0,
+        );
     }
 }

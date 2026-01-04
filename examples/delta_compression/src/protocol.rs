@@ -1,58 +1,39 @@
-//! This file contains the shared [`Protocol`] that defines the messages that can be sent between the client and server.
+//! Protocol definitions for delta compression example.
 //!
-//! You will need to define the [`Components`], [`Messages`] and [`Inputs`] that make up the protocol.
-//! You can use the `#[protocol]` attribute to specify additional behaviour:
-//! - how entities contained in the message should be mapped from the remote world to the local world
-//! - how the component should be synchronized between the `Confirmed` entity and the `Predicted`/`Interpolated` entity
+//! The key feature is the `Diffable` trait implementation on `PlayerPosition`,
+//! which enables delta compression - sending only the change rather than the full value.
+
 use bevy::ecs::entity::MapEntities;
+use bevy::math::Curve;
 use bevy::prelude::*;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::{info, trace};
+use tracing::trace;
 
-// Player
-#[derive(Bundle)]
-pub(crate) struct PlayerBundle {
-    id: PlayerId,
-    position: PlayerPosition,
-    color: PlayerColor,
-}
+// ============ Components ============
 
-impl PlayerBundle {
-    pub(crate) fn new(id: PeerId, position: Vec2) -> Self {
-        // Generate pseudo random color from client id.
-        let h = (((id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
-        let s = 0.8;
-        let l = 0.5;
-        let color = Color::hsl(h, s, l);
-        Self {
-            id: PlayerId(id),
-            position: PlayerPosition(position),
-            color: PlayerColor(color),
-        }
-    }
-}
+/// Player identifier
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerId(pub u64);
 
-// Components
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct PlayerId(PeerId);
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut)]
+/// Player position - with delta compression support
+/// Instead of sending full Vec2 (8 bytes), sends delta as (i8, i8) (2 bytes)
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
 pub struct PlayerPosition(pub Vec2);
 
 impl Ease for PlayerPosition {
     fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
             PlayerPosition(Vec2::lerp(start.0, end.0, t))
         })
     }
 }
 
+/// Maximum position change per tick that can be encoded
 const MAX_POSITION_DELTA: f32 = 200.0;
 
-// Since between two ticks the position doesn't change much, we could encode
-// the diff using a discrete set of values to reduce the bandwidth
+/// Delta compression implementation for PlayerPosition
+/// Compresses Vec2 changes to (i8, i8) - 75% bandwidth reduction
 impl Diffable<(i8, i8)> for PlayerPosition {
     fn base_value() -> Self {
         Self(Vec2::new(0.0, 0.0))
@@ -62,11 +43,12 @@ impl Diffable<(i8, i8)> for PlayerPosition {
         let mut diff = new.0 - self.0;
 
         // Clamp the diff to a discrete set of values
-        // i.e i8::MIN = -10.0, i8::MAX = 10.0
+        // i.e i8::MIN = -MAX_POSITION_DELTA, i8::MAX = MAX_POSITION_DELTA
         diff.x = diff.x.clamp(-MAX_POSITION_DELTA, MAX_POSITION_DELTA);
         diff.y = diff.y.clamp(-MAX_POSITION_DELTA, MAX_POSITION_DELTA);
         diff.x = diff.x / MAX_POSITION_DELTA * (i8::MAX as f32);
         diff.y = diff.y / MAX_POSITION_DELTA * (i8::MAX as f32);
+        
         trace!(
             "Computing diff between {:?} and {:?}: {:?}",
             self,
@@ -87,63 +69,57 @@ impl Diffable<(i8, i8)> for PlayerPosition {
     }
 }
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-pub struct PlayerColor(pub(crate) Color);
+/// Player color
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerColor(pub Color);
 
-// Inputs
+// ============ Inputs ============
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Reflect)]
+/// Direction input
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
 pub struct Direction {
-    pub(crate) up: bool,
-    pub(crate) down: bool,
-    pub(crate) left: bool,
-    pub(crate) right: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
 }
 
 impl Direction {
-    pub(crate) fn is_none(&self) -> bool {
+    #[allow(dead_code)]
+    pub fn is_none(&self) -> bool {
         !self.up && !self.down && !self.left && !self.right
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect, Default)]
 pub enum Inputs {
+    #[default]
+    None,
     Direction(Direction),
 }
 
-impl Default for Inputs {
-    fn default() -> Self {
-        Self::Direction(Direction {
-            up: false,
-            down: false,
-            left: false,
-            right: false,
-        })
-    }
-}
-
 impl MapEntities for Inputs {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, _entity_mapper: &mut M) {}
 }
 
-// Protocol
-#[derive(Clone)]
-pub(crate) struct ProtocolPlugin;
+// ============ Protocol Plugin ============
+
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
+        // Register inputs
         app.add_plugins(lightyear::prelude::input::native::InputPlugin::<Inputs>::default());
-        // components
-        // Use PredictionMode and InterpolationMode
+        
+        // Register components
         app.register_component::<PlayerId>();
-
+        app.register_component::<PlayerColor>();
+        
+        // PlayerPosition with prediction, interpolation, AND delta compression
+        // NOTE: delta compression must be added AFTER prediction/interpolation
         app.register_component::<PlayerPosition>()
             .add_prediction()
             .add_linear_interpolation()
-            // NOTE: currently there is a limitation that DeltaCompression must be added AFTER prediction/interpolation
             .add_delta_compression::<(i8, i8)>();
-
-        app.register_component::<PlayerColor>();
     }
 }

@@ -1,27 +1,16 @@
-use crate::protocol::WeaponType::Hitscan;
-use crate::shared::{DespawnAfter, color_from_id};
+//! Protocol definitions for projectiles example
+
+use crate::shared::color_from_id;
 use avian2d::prelude::*;
 use bevy::ecs::entity::MapEntities;
 use bevy::prelude::*;
-use lightyear::input::bei::prelude;
+use lightyear::input::bei::prelude::*;
 use lightyear::input::prelude::InputConfig;
-use lightyear::prelude::Channel;
-use lightyear::prelude::input::bei::InputAction;
-use lightyear::prelude::input::bei::*;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub const BULLET_SIZE: f32 = 3.0;
 pub const PLAYER_SIZE: f32 = 40.0;
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct Bot;
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PredictedBot;
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct InterpolatedBot;
 
 // Components
 #[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Reflect)]
@@ -30,12 +19,11 @@ pub struct PlayerId(pub PeerId);
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct PlayerMarker;
 
-/// Number of bullet hits
 #[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct Score(pub usize);
 
 #[derive(Component, Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Reflect)]
-pub struct ColorComponent(pub(crate) Color);
+pub struct ColorComponent(pub Color);
 
 #[derive(Component, MapEntities, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct BulletMarker {
@@ -43,10 +31,11 @@ pub struct BulletMarker {
     pub shooter: Entity,
 }
 
-// Inputs
+// Input context
 #[derive(Component, Serialize, Deserialize, Reflect, Clone, Debug, PartialEq)]
 pub struct PlayerContext;
 
+// Input actions
 #[derive(Debug, InputAction)]
 #[action_output(Vec2)]
 pub struct MovePlayer;
@@ -59,34 +48,20 @@ pub struct MoveCursor;
 #[action_output(bool)]
 pub struct Shoot;
 
-#[derive(Debug, InputAction)]
-#[action_output(bool)]
-pub struct CycleWeapon;
-
+// Global context for weapon/mode switching
 #[derive(Component, Serialize, Deserialize, Reflect, Clone, Debug, PartialEq)]
 pub struct ClientContext;
 
 #[derive(Debug, InputAction)]
 #[action_output(bool)]
-pub struct CycleProjectileMode;
+pub struct CycleWeapon;
 
-#[derive(Debug, InputAction)]
-#[action_output(bool)]
-pub struct CycleReplicationMode;
-
-#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
+// Weapon types
+#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Reflect, Default)]
 pub enum WeaponType {
+    #[default]
     Hitscan,
     Bullet,
-    // Shotgun,
-    // PhysicsProjectile,
-    // HomingMissile,
-}
-
-impl Default for WeaponType {
-    fn default() -> Self {
-        WeaponType::Hitscan
-    }
 }
 
 impl WeaponType {
@@ -94,9 +69,6 @@ impl WeaponType {
         match self {
             WeaponType::Hitscan => WeaponType::Bullet,
             WeaponType::Bullet => WeaponType::Hitscan,
-            // WeaponType::Shotgun => WeaponType::PhysicsProjectile,
-            // WeaponType::PhysicsProjectile => WeaponType::HomingMissile,
-            // WeaponType::HomingMissile => WeaponType::Hitscan,
         }
     }
 
@@ -104,9 +76,6 @@ impl WeaponType {
         match self {
             WeaponType::Hitscan => "Hitscan",
             WeaponType::Bullet => "Linear Projectile",
-            // WeaponType::Shotgun => "Shotgun",
-            // WeaponType::PhysicsProjectile => "Physics Projectile",
-            // WeaponType::HomingMissile => "Homing Missile",
         }
     }
 
@@ -114,151 +83,23 @@ impl WeaponType {
         match self {
             WeaponType::Hitscan => 5.0,
             WeaponType::Bullet => 2.0,
-            // WeaponType::Shotgun => 1.0,
-            // WeaponType::PhysicsProjectile => 1.5,
-            // WeaponType::HomingMissile => 0.5,
         }
     }
 }
 
-#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
-pub enum ProjectileReplicationMode {
-    FullEntity, // Spawn a new entity per projectile
-    DirectionOnly, // Only initial direction replicated
-                // RingBuffer,    // Weapon component with ring buffer
-}
-
-impl Default for ProjectileReplicationMode {
-    fn default() -> Self {
-        ProjectileReplicationMode::FullEntity
-    }
-}
-
-impl ProjectileReplicationMode {
-    pub fn next(&self) -> Self {
-        match self {
-            ProjectileReplicationMode::FullEntity => ProjectileReplicationMode::DirectionOnly,
-            ProjectileReplicationMode::DirectionOnly => ProjectileReplicationMode::FullEntity,
-            // ProjectileReplicationMode::RingBuffer => ProjectileReplicationMode::FullEntity,
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            ProjectileReplicationMode::FullEntity => "Full Entity Replication",
-            ProjectileReplicationMode::DirectionOnly => "Direction-Only Replication",
-            // ProjectileReplicationMode::RingBuffer => "Ring Buffer Replication",
-        }
-    }
-}
-
-#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Reflect)]
-pub enum GameReplicationMode {
-    // TODO: do we predict other entities shooting? or just their movement?
-    //  maybe just their movement?
-    AllPredicted, // Current mode: client predicts all entities, server hit detection with no lag comp. (favors the shootee)
-    ClientPredictedNoComp, // Client predicted, enemies interpolated, no lag comp
-    ClientPredictedLagComp, // Client predicted, enemies interpolated, with lag comp
-    ClientSideHitDetection, // Client predicted, enemies interpolated, hits computed on client
-    AllInterpolated, // Everything interpolated with delay
-    OnlyInputsReplicated, // Everything predicted, only inputs replicated
-}
-
-impl Default for GameReplicationMode {
-    fn default() -> Self {
-        GameReplicationMode::AllPredicted
-    }
-}
-
-impl GameReplicationMode {
-    pub fn next(&self) -> Self {
-        match self {
-            GameReplicationMode::AllPredicted => GameReplicationMode::ClientPredictedNoComp,
-            GameReplicationMode::ClientPredictedNoComp => {
-                GameReplicationMode::ClientPredictedLagComp
-            }
-            GameReplicationMode::ClientPredictedLagComp => {
-                GameReplicationMode::ClientSideHitDetection
-            }
-            GameReplicationMode::ClientSideHitDetection => GameReplicationMode::AllInterpolated,
-            GameReplicationMode::AllInterpolated => GameReplicationMode::OnlyInputsReplicated,
-            GameReplicationMode::OnlyInputsReplicated => GameReplicationMode::AllPredicted,
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            GameReplicationMode::AllPredicted => "All Predicted (Server Hit Detection)",
-            GameReplicationMode::ClientPredictedNoComp => "Client Predicted (No Lag Comp)",
-            GameReplicationMode::ClientPredictedLagComp => "Client Predicted (Lag Comp)",
-            GameReplicationMode::ClientSideHitDetection => "Client-Side Hit Detection",
-            GameReplicationMode::AllInterpolated => "All Interpolated",
-            GameReplicationMode::OnlyInputsReplicated => "Only Inputs Replicated",
-        }
-    }
-
-    pub fn room_id(&self) -> usize {
-        match self {
-            GameReplicationMode::AllPredicted => 0,
-            GameReplicationMode::ClientPredictedNoComp => 1,
-            GameReplicationMode::ClientPredictedLagComp => 2,
-            GameReplicationMode::ClientSideHitDetection => 3,
-            GameReplicationMode::AllInterpolated => 4,
-            GameReplicationMode::OnlyInputsReplicated => 5,
-        }
-    }
-
-    pub fn from_room_id(room_id: usize) -> Self {
-        match room_id {
-            0 => GameReplicationMode::AllPredicted,
-            1 => GameReplicationMode::ClientPredictedNoComp,
-            2 => GameReplicationMode::ClientPredictedLagComp,
-            3 => GameReplicationMode::ClientSideHitDetection,
-            4 => GameReplicationMode::AllInterpolated,
-            5 => GameReplicationMode::OnlyInputsReplicated,
-            _ => GameReplicationMode::AllPredicted, // Default fallback
-        }
-    }
-}
-
+// Weapon component
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct Weapon {
     pub last_fire_tick: Option<Tick>,
-    // Ring buffer for projectiles (used with RingBuffer replication mode)
-    pub projectile_buffer: Vec<ProjectileSpawnInfo>,
-    pub buffer_capacity: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct ProjectileSpawnInfo {
-    pub spawn_tick: Tick,
-    pub position: Position,
-    pub rotation: Rotation,
-    pub weapon_type: WeaponType,
 }
 
 impl Default for Weapon {
     fn default() -> Self {
-        Self {
-            last_fire_tick: None,
-            projectile_buffer: Vec::new(),
-            buffer_capacity: 100,
-        }
+        Self { last_fire_tick: None }
     }
 }
 
-#[derive(Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
-pub struct PlayerRoom {
-    pub room_id: usize,
-}
-
-impl Default for PlayerRoom {
-    fn default() -> Self {
-        Self { room_id: 0 }
-    }
-}
-
-// Additional projectile-specific components
+// Hitscan visual component
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub struct HitscanVisual {
     pub start: Vec2,
@@ -267,39 +108,7 @@ pub struct HitscanVisual {
     pub max_lifetime: f32,
 }
 
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PhysicsProjectile {
-    pub bounce_count: u32,
-    pub max_bounces: u32,
-    pub deceleration: f32,
-}
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct HomingMissile {
-    pub target_entity: Option<Entity>,
-    pub turn_speed: f32,
-    pub acceleration: f32,
-}
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct ShotgunPellet {
-    pub pellet_index: u32,
-    pub spread_angle: f32,
-}
-
-// Components for direction-only replication
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct ProjectileSpawn {
-    pub spawn_tick: Tick,
-    pub position: Position,
-    pub rotation: Rotation,
-    pub speed: f32,
-    pub color: ColorComponent,
-    pub weapon_type: WeaponType,
-    pub shooter: Entity,
-    pub player_id: PeerId,
-}
-
+// Hit detection event
 #[derive(MapEntities, Event, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HitDetected {
     #[entities]
@@ -308,36 +117,55 @@ pub struct HitDetected {
     pub target: Entity,
 }
 
+// Channel for hit events
 pub struct HitChannel;
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// Physics bundle
+#[derive(Bundle)]
+pub struct PhysicsBundle {
+    pub collider: Collider,
+    pub collider_density: ColliderDensity,
+    pub rigid_body: RigidBody,
+}
+
+impl PhysicsBundle {
+    pub fn player() -> Self {
+        Self {
+            collider: Collider::rectangle(PLAYER_SIZE, PLAYER_SIZE),
+            collider_density: ColliderDensity(0.2),
+            rigid_body: RigidBody::Kinematic,
+        }
+    }
+
+    pub fn bullet() -> Self {
+        Self {
+            collider: Collider::circle(BULLET_SIZE),
+            collider_density: ColliderDensity(0.05),
+            rigid_body: RigidBody::Dynamic,
+        }
+    }
+}
+
+// Protocol plugin
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        app.register_type::<(Actions<PlayerMarker>, ActionOf<PlayerMarker>)>();
-
         // inputs
         app.add_plugins(InputPlugin::new(InputConfig::<PlayerContext> {
-            // enable lag compensation; the input messages sent to the server will include the
-            // interpolation delay of that client
             lag_compensation: true,
-            // enable input rebroadcasting so clients can predict other players' actions
             rebroadcast_inputs: true,
             ..default()
         }));
         app.register_input_action::<MovePlayer>();
         app.register_input_action::<MoveCursor>();
         app.register_input_action::<Shoot>();
-        app.register_input_action::<CycleWeapon>();
 
         app.add_plugins(InputPlugin::new(InputConfig::<ClientContext> {
-            // we don't want these actions to be replayed when a rollback happens
             ignore_rollbacks: true,
             ..default()
         }));
-        app.register_input_action::<CycleProjectileMode>();
-        app.register_input_action::<CycleReplicationMode>();
+        app.register_input_action::<CycleWeapon>();
 
         // channel
         app.add_channel::<HitChannel>(ChannelSettings {
@@ -373,54 +201,12 @@ impl Plugin for ProtocolPlugin {
             .add_should_rollback(linear_velocity_should_rollback);
 
         app.register_component::<ColorComponent>();
-
         app.register_component::<Score>();
-
-        // we replicate HitscanVisual for the AllInterpolation mode
-        // make sure that we have an Interpolated HitscanVisual entity since we only render entities
-        // that are interpolated or predicted
         app.register_component::<HitscanVisual>();
-
-        // We do not need to replicate RigidBody:
-        // - for interpolated entities, we just interpolate between Position updates
-        // - for predicted entities, we add the RigidBody component ourselves?
-        // The issue we want to avoid is that we don't want RigidBody to be included on Interpolated
-        // entities because that means that we would be doing expensive simulation work on interpolated
-        // entities.
         app.register_component::<RigidBody>();
-
         app.register_component::<BulletMarker>().add_map_entities();
-
-        app.register_component::<Bot>();
-
-        app.register_component::<Score>();
-
-        app.register_component::<PredictedBot>();
-
-        app.register_component::<InterpolatedBot>();
-
-        // Register new weapon and projectile components
         app.register_component::<WeaponType>();
-
         app.register_component::<Weapon>().add_prediction();
-
-        app.register_component::<ProjectileReplicationMode>();
-
-        app.register_component::<GameReplicationMode>();
-
-        app.register_component::<PlayerRoom>();
-
-        app.register_component::<PhysicsProjectile>()
-            .add_prediction();
-
-        app.register_component::<HomingMissile>().add_prediction();
-
-        app.register_component::<ShotgunPellet>();
-
-        app.register_component::<ProjectileSpawn>();
-
-        // Make sure that we rollback the DespawnAfter timer in deterministic replication mode
-        app.add_rollback::<DespawnAfter>();
     }
 }
 

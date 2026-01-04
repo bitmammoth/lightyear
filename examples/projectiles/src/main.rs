@@ -1,91 +1,80 @@
-#![allow(clippy::all)]
+//! Multi-Transport Projectiles Example
+//!
+//! Demonstrates projectile shooting with different replication modes across
+//! UDP, WebTransport, and WebSocket transports.
+//!
+//! Features:
+//! - Multiple weapon types (Hitscan, Bullet)
+//! - Multiple replication modes (AllPredicted, ClientPredicted, etc.)
+//! - Lag compensation for fair hit detection
+//!
+//! Run with:
+//! - `cargo run -- server`
+//! - `cargo run -- client --transport udp`
+//! - `cargo run -- client --transport webtransport --cert <DIGEST>`
+//! - `cargo run -- client --transport websocket`
+
 #![allow(unused_imports)]
-#![allow(unused_variables)]
 #![allow(dead_code)]
-#![allow(unused_mut)]
-extern crate core;
 
 use bevy::prelude::*;
-use core::time::Duration;
-use lightyear::prelude::{ReplicationSender, SendUpdatesMode};
-use lightyear_examples_common::cli::{Cli, Mode};
-use lightyear_examples_common::shared::{FIXED_TIMESTEP_HZ, SEND_INTERVAL};
-
-#[cfg(feature = "client")]
-use crate::client::ExampleClientPlugin;
-use crate::protocol::ClientContext;
-#[cfg(feature = "server")]
-use crate::server::ExampleServerPlugin;
-use crate::shared::SharedPlugin;
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[cfg(feature = "client")]
 mod client;
 mod protocol;
-
-#[cfg(feature = "gui")]
-mod renderer;
-
-#[cfg(feature = "server")]
 mod server;
 mod shared;
-fn main() {
-    let cli = Cli::default();
-
-    let mut app = cli.build_app(Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ), true);
-
-    app.add_plugins(SharedPlugin);
-
-    cli.spawn_connections(&mut app);
-
-    match cli.mode {
-        #[cfg(feature = "client")]
-        Some(Mode::Client { .. }) => {
-            app.add_plugins(ExampleClientPlugin);
-            update_client(&mut app);
-        }
-        #[cfg(feature = "server")]
-        Some(Mode::Server) => {
-            app.add_plugins(ExampleServerPlugin);
-        }
-        #[cfg(all(feature = "client", feature = "server"))]
-        Some(Mode::HostClient { client_id }) => {
-            app.add_plugins(ExampleClientPlugin);
-            app.add_plugins(ExampleServerPlugin);
-            update_client(&mut app);
-        }
-        _ => {}
-    }
-
-    #[cfg(feature = "gui")]
-    app.add_plugins(renderer::ExampleRendererPlugin);
-
-    // run the app
-    app.run();
-}
 
 #[cfg(feature = "client")]
-fn update_client(app: &mut App) {
-    use lightyear::prelude::client::{InputDelayConfig, InputTimelineConfig};
-    use lightyear::prelude::{Client, InputTimeline, Timeline};
-    let client = app
-        .world_mut()
-        .query_filtered::<Entity, With<Client>>()
-        .single(app.world_mut())
-        .unwrap();
+use client::run_client;
+use server::run_server;
 
-    // we need to add a ReplicationSender to the client entity to replicate the Action entities to the server
-    app.world_mut()
-        .entity_mut(client)
-        .insert((ReplicationSender::new(
-            SEND_INTERVAL,
-            SendUpdatesMode::SinceLastAck,
-            false,
-        ),));
+#[derive(Parser)]
+#[command(name = "projectiles")]
+#[command(about = "Multi-transport projectiles demo")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    // // set some input-delay since we are predicting all entities
-    // app.world_mut()
-    //     .entity_mut(client)
-    //     .insert(InputTimeline(Timeline::from(
-    //         Input::default().with_input_delay(InputDelayConfig::fixed_input_delay(0)),
-    //     )));
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the server (listens on UDP:5000, WebTransport:5001, WebSocket:5002)
+    Server,
+    /// Run a client
+    Client {
+        /// Transport protocol to use
+        #[arg(short, long, default_value = "udp")]
+        transport: TransportArg,
+        /// Certificate digest (required for WebTransport)
+        #[arg(short, long)]
+        cert: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum, Default)]
+pub enum TransportArg {
+    #[default]
+    Udp,
+    Webtransport,
+    Websocket,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Server => {
+            run_server();
+        }
+        #[cfg(feature = "client")]
+        Commands::Client { transport, cert } => {
+            run_client(transport, cert);
+        }
+        #[cfg(not(feature = "client"))]
+        Commands::Client { .. } => {
+            eprintln!("Client feature not enabled. Compile with --features client");
+        }
+    }
 }

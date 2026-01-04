@@ -1,42 +1,38 @@
 // src/config.rs
+//! Configuration types for the multi-transport launcher.
+
 use bevy::prelude::{Reflect, Resource};
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
-// Import serde traits
-use lightyear_examples_common::client::ClientTransports;
-use lightyear_examples_common::server::ServerTransports;
-use lightyear_examples_common::shared::SharedSettings;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString};
 
 // --- Constants ---
 pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
-pub const SERVER_PORT: u16 = 5000;
-/// 0 means that the OS will assign any available port
+pub const SERVER_UDP_PORT: u16 = 5000;
+pub const SERVER_WEBTRANSPORT_PORT: u16 = 5001;
+pub const SERVER_WEBSOCKET_PORT: u16 = 5002;
 pub const CLIENT_PORT: u16 = 0;
-pub const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SERVER_PORT);
-pub const SHARED_SETTINGS: SharedSettings = SharedSettings {
-    protocol_id: 0,
-    private_key: [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-};
-pub const SEND_INTERVAL: Duration = Duration::from_millis(100);
+pub const SERVER_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+pub const PROTOCOL_ID: u64 = 0;
+pub const PRIVATE_KEY: [u8; 32] = [0u8; 32];
 
 // --- Configuration Enums ---
 
-// TODO: Discover examples dynamically? For now, hardcode them.
-// Make sure these derive Serialize and Deserialize
+/// Available examples in the launcher
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, Display, Serialize, Deserialize, Reflect,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, Display, Serialize, Deserialize, Reflect, Default,
 )]
 pub enum Example {
+    #[default]
     SimpleBox,
-    Fps,
-    // Add other examples here
+    // TODO: Add more examples as they're created
+    // Fps,
+    // Lobby,
 }
 
+/// Networking mode for the instance
 #[derive(
     Debug,
     Clone,
@@ -50,45 +46,100 @@ pub enum Example {
     Serialize,
     Deserialize,
     Reflect,
+    Default,
 )]
 pub enum NetworkingMode {
     ClientOnly,
+    #[default]
     ServerOnly,
-    HostServer, // Server + Client in the same app
+    HostServer,
+}
+
+/// Client transport selection
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, Display, Serialize, Deserialize, Reflect, Default,
+)]
+pub enum ClientTransport {
+    #[default]
+    Udp,
+    WebTransport,
+    WebSocket,
+}
+
+impl ClientTransport {
+    pub fn default_port(&self) -> u16 {
+        match self {
+            ClientTransport::Udp => SERVER_UDP_PORT,
+            ClientTransport::WebTransport => SERVER_WEBTRANSPORT_PORT,
+            ClientTransport::WebSocket => SERVER_WEBSOCKET_PORT,
+        }
+    }
 }
 
 // --- Main Configuration Struct ---
 
-// Add Serialize, Deserialize derives
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub example: Example,
     pub mode: NetworkingMode,
-    // Use Options for conditional settings
-    pub client_transport: Option<ClientTransports>,
-    pub server_transport: Option<ServerTransports>,
-    pub client_id: Option<u64>,
-    pub server_addr: Option<SocketAddr>, // Used for client connect AND server bind
-    #[serde(with = "duration_serde")] // Use helper for Duration serialization
+    pub client_transport: ClientTransport,
+    pub client_id: u64,
+    pub server_ip: String,
+    #[serde(with = "duration_serde")]
     pub tick_duration: Duration,
-    // TODO: Add LinkConditioner settings
-    // TODO: Add other settings like auth, encryption?
+    // Server settings - multi-transport supports all three
+    pub enable_udp: bool,
+    pub enable_webtransport: bool,
+    pub enable_websocket: bool,
+    pub udp_port: u16,
+    pub webtransport_port: u16,
+    pub websocket_port: u16,
 }
 
 impl Default for LauncherConfig {
     fn default() -> Self {
-        let default_mode = NetworkingMode::HostServer;
         Self {
-            example: Example::SimpleBox,
-            mode: default_mode,
-            // Set initial defaults based on HostServer mode
-            client_transport: Some(ClientTransports::Udp),
-            client_id: Some(0),
-            server_addr: Some(SERVER_ADDR),
-            server_transport: Some(ServerTransports::Udp {
-                local_port: SERVER_PORT,
-            }),
+            example: Example::default(),
+            mode: NetworkingMode::default(),
+            client_transport: ClientTransport::default(),
+            client_id: rand::random::<u64>() % 1000,
+            server_ip: "127.0.0.1".to_string(),
             tick_duration: Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ),
+            // Server defaults - enable all transports
+            enable_udp: true,
+            enable_webtransport: true,
+            enable_websocket: true,
+            udp_port: SERVER_UDP_PORT,
+            webtransport_port: SERVER_WEBTRANSPORT_PORT,
+            websocket_port: SERVER_WEBSOCKET_PORT,
+        }
+    }
+}
+
+impl LauncherConfig {
+    /// Get the server address for the selected client transport
+    pub fn server_addr(&self) -> SocketAddr {
+        let port = self.client_transport.default_port();
+        let ip: IpAddr = self.server_ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        SocketAddr::new(ip, port)
+    }
+
+    /// Check if configuration is valid for the selected mode
+    pub fn is_valid(&self) -> bool {
+        match self.mode {
+            NetworkingMode::ClientOnly => {
+                // Client needs a valid server IP
+                self.server_ip.parse::<IpAddr>().is_ok()
+            }
+            NetworkingMode::ServerOnly => {
+                // Server needs at least one transport enabled
+                self.enable_udp || self.enable_webtransport || self.enable_websocket
+            }
+            NetworkingMode::HostServer => {
+                // Both client and server requirements
+                self.server_ip.parse::<IpAddr>().is_ok()
+                    && (self.enable_udp || self.enable_webtransport || self.enable_websocket)
+            }
         }
     }
 }
@@ -111,67 +162,5 @@ mod duration_serde {
     {
         let secs = f64::deserialize(deserializer)?;
         Ok(Duration::from_secs_f64(secs))
-    }
-}
-
-// Need FromStr for Example to be used in UI Combobox or initial default parsing if needed elsewhere
-// Note: Clap will no longer use this directly.
-impl core::str::FromStr for Example {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "simplebox" => Ok(Example::SimpleBox),
-            "fps" => Ok(Example::Fps),
-            _ => Err(format!("Unknown example: {}", s)),
-        }
-    }
-}
-
-impl LauncherConfig {
-    pub fn update_defaults_for_mode(&mut self, new_mode: NetworkingMode) {
-        self.mode = new_mode;
-        match new_mode {
-            NetworkingMode::ClientOnly => {
-                if self.client_id.is_none() {
-                    self.client_id = Some(rand::random());
-                }
-                if self.server_addr.is_none() {
-                    self.server_addr = Some(SERVER_ADDR);
-                }
-                if self.client_transport.is_none() {
-                    self.client_transport = Some(ClientTransports::Udp);
-                }
-                self.server_transport = None;
-            }
-            NetworkingMode::ServerOnly => {
-                if self.server_addr.is_none() {
-                    self.server_addr = Some(SERVER_ADDR);
-                }
-                if self.server_transport.is_none() {
-                    self.server_transport = Some(ServerTransports::Udp {
-                        local_port: self.server_addr.map_or(SERVER_PORT, |a| a.port()),
-                    });
-                }
-                self.client_id = None;
-                self.client_transport = None;
-            }
-            NetworkingMode::HostServer => {
-                if self.client_id.is_none() {
-                    self.client_id = Some(rand::random());
-                }
-                if self.server_addr.is_none() {
-                    self.server_addr = Some(SERVER_ADDR);
-                }
-                if self.client_transport.is_none() {
-                    self.client_transport = Some(ClientTransports::Udp);
-                }
-                if self.server_transport.is_none() {
-                    self.server_transport = Some(ServerTransports::Udp {
-                        local_port: self.server_addr.map_or(SERVER_PORT, |a| a.port()),
-                    });
-                }
-            }
-        }
     }
 }

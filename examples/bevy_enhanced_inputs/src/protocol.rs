@@ -1,15 +1,21 @@
+//! Protocol definitions for bevy_enhanced_input integration
+//!
+//! Defines components, inputs (via BEI), and registers them with lightyear.
+
 use bevy::math::Curve;
 use bevy::prelude::*;
-use bevy::prelude::{App, Plugin};
 use lightyear::input::prelude::InputConfig;
 use lightyear::prelude::input::bei::*;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // Components
+
+/// Identifies which peer owns this player
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PlayerId(pub PeerId);
 
+/// Player position - supports interpolation via the Ease trait
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut)]
 pub struct PlayerPosition(pub Vec2);
 
@@ -21,26 +27,29 @@ impl Ease for PlayerPosition {
     }
 }
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-pub struct PlayerColor(pub(crate) Color);
+/// Player color for visual distinction
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlayerColor(pub Color);
 
-// Inputs
+// Inputs using bevy_enhanced_input
 
-// the context will be replicated
+/// The context component for player inputs - will be replicated
 #[derive(Component, Serialize, Deserialize, Reflect, Clone, Debug, PartialEq)]
 pub struct Player;
 
+/// Movement action - outputs a Vec2 direction
 #[derive(Debug, InputAction)]
 #[action_output(Vec2)]
 pub struct Movement;
 
-// Protocol
+// Protocol Plugin
+
 #[derive(Clone)]
 pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
+        // Register BEI inputs
         app.add_plugins(InputPlugin::<Player> {
             config: InputConfig::<Player> {
                 rebroadcast_inputs: true,
@@ -49,9 +58,9 @@ impl Plugin for ProtocolPlugin {
         });
         app.register_input_action::<Movement>();
 
-        // components
+        // Register components
         app.register_component::<PlayerId>();
-
+        
         app.register_component::<PlayerPosition>()
             .add_prediction()
             .add_linear_interpolation();

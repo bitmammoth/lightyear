@@ -1,67 +1,75 @@
+//! Protocol definitions for the network visibility example.
+
 use bevy::ecs::entity::MapEntities;
-use bevy::math::Vec2;
+use bevy::math::Curve;
 use bevy::prelude::*;
-use lightyear::input::native::plugin::InputPlugin;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Components
+// ============ Components ============
 
+/// Unique identifier for each player - wraps PeerId
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PlayerId(pub PeerId);
 
+/// Position in 2D space
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut)]
-pub struct Position(pub(crate) Vec2);
+pub struct Position(pub Vec2);
 
 impl Ease for Position {
     fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
             Position(Vec2::lerp(start.0, end.0, t))
         })
     }
 }
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-pub struct PlayerColor(pub(crate) Color);
+/// Color for rendering
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlayerColor(pub Color);
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-// Marker component
+/// Marker component for circles (used for visibility demo)
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct CircleMarker;
 
-// Inputs
+// ============ Inputs ============
 
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone, Reflect)]
+/// Input directions
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
 pub struct Inputs {
-    pub(crate) up: bool,
-    pub(crate) down: bool,
-    pub(crate) left: bool,
-    pub(crate) right: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
 }
 
 impl Inputs {
-    pub(crate) fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> bool {
         !self.up && !self.down && !self.left && !self.right
     }
 }
 
 impl MapEntities for Inputs {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, _entity_mapper: &mut M) {}
 }
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// ============ Protocol Plugin ============
+
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // inputs
-        app.add_plugins(InputPlugin::<Inputs>::default());
-        // components
+        // Register inputs
+        app.add_plugins(lightyear::prelude::input::native::InputPlugin::<Inputs>::default());
+        
+        // Register components
         app.register_component::<PlayerId>();
-
+        app.register_component::<PlayerColor>();
+        app.register_component::<CircleMarker>();
+        
+        // Position with prediction and interpolation
         app.register_component::<Position>()
             .add_prediction()
             .add_linear_interpolation();
-        app.register_component::<PlayerColor>();
-        app.register_component::<CircleMarker>();
     }
 }

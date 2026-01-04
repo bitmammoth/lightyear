@@ -1,4 +1,5 @@
-use crate::shared::color_from_id;
+//! Protocol definitions for deterministic replication
+
 use avian2d::prelude::*;
 use bevy::prelude::*;
 use leafwing_input_manager::prelude::*;
@@ -11,15 +12,15 @@ pub const BALL_SIZE: f32 = 15.0;
 pub const PLAYER_SIZE: f32 = 40.0;
 
 #[derive(Bundle)]
-pub(crate) struct PhysicsBundle {
-    pub(crate) collider: Collider,
-    pub(crate) collider_density: ColliderDensity,
-    pub(crate) rigid_body: RigidBody,
-    pub(crate) restitution: Restitution,
+pub struct PhysicsBundle {
+    pub collider: Collider,
+    pub collider_density: ColliderDensity,
+    pub rigid_body: RigidBody,
+    pub restitution: Restitution,
 }
 
 impl PhysicsBundle {
-    pub(crate) fn ball() -> Self {
+    pub fn ball() -> Self {
         Self {
             collider: Collider::circle(BALL_SIZE),
             collider_density: ColliderDensity(0.05),
@@ -28,7 +29,7 @@ impl PhysicsBundle {
         }
     }
 
-    pub(crate) fn player() -> Self {
+    pub fn player() -> Self {
         Self {
             collider: Collider::rectangle(PLAYER_SIZE, PLAYER_SIZE),
             collider_density: ColliderDensity(0.2),
@@ -43,20 +44,10 @@ impl PhysicsBundle {
 pub struct PlayerId(pub PeerId);
 
 #[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-pub struct ColorComponent(pub(crate) Color);
+pub struct ColorComponent(pub Color);
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BallMarker;
-
-// Messages
-
-#[derive(Event, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Ready;
-
-// Channel
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Channel1;
 
 // Inputs
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash, Reflect, Actionlike)]
@@ -69,7 +60,7 @@ pub enum PlayerActions {
 
 // Protocol
 #[derive(Clone)]
-pub(crate) struct ProtocolPlugin;
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
@@ -81,31 +72,20 @@ impl Plugin for ProtocolPlugin {
             },
         });
 
-        // channel
-        app.add_channel::<Channel1>(ChannelSettings {
-            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
-            ..default()
-        })
-        .add_direction(NetworkDirection::ClientToServer);
-
-        // messages
-        app.register_event::<Ready>()
-            .add_direction(NetworkDirection::ClientToServer);
-
         // components
         app.register_component::<PlayerId>();
 
-        // add prediction for non-networked components
+        // add prediction for non-networked physics components with checksums
         app.add_rollback::<Position>()
             // add a hash function to perform a checksum in order to catch desyncs
-            .add_custom_hash(lightyear_avian2d::types::position::hash)
+            .add_custom_hash(lightyear::avian2d::types::position::hash)
             // register a linear interpolation function without actually running Interpolation systems
             // it will be used for FrameInterpolation
             .register_linear_interpolation()
             .add_linear_correction_fn();
 
         app.add_rollback::<Rotation>()
-            .add_custom_hash(lightyear_avian2d::types::rotation::hash)
+            .add_custom_hash(lightyear::avian2d::types::rotation::hash)
             .register_linear_interpolation()
             .add_linear_correction_fn();
 

@@ -1,50 +1,47 @@
 [package]
 name = "lobby"
 version = "0.25.5"
-authors = ["Charles Bournhonesque <charlesbour@gmail.com>"]
 edition = "2021"
-description = "Examples for the lightyearServer-client networking library for the Bevy game engine"
-readme = "README.md"
-repository = "https://github.com/cBournhonesque/lightyear"
-keywords = ["bevy", "multiplayer", "networking", "netcode", "gamedev"]
-categories = ["game-development", "network-programming"]
-license = "MIT OR Apache-2.0"
 publish = false
 
 [features]
-default = ["client", "gui", "server", "netcode", "udp"]
-client = [
-  "gui",
-  "lightyear/client",
-  "lightyear_examples_common/client",
-  # Lobby example needs server functionality on the client side too
-  "lightyear/server",
-  "lightyear_examples_common/server",
-]
-gui = ["lightyear_examples_common/gui"]
-server = ["lightyear/server", "lightyear_examples_common/server"]
-netcode = ["lightyear_examples_common/netcode"]
-udp = ["lightyear_examples_common/udp", "lightyear/std", "lightyear/udp"]
+default = ["client", "server", "gui"]
+client = ["lightyear/client"]
+server = ["lightyear/server"]
+gui = []
 
 [dependencies]
-lightyear = { workspace = true, features = [
-  "interpolation",
-  "prediction",
-  "replication",
-  "leafwing",
-  "input_native",
+bevy = { workspace = true, features = [
+    "bevy_gizmos",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
+    "png",
+    "x11",
 ] }
-lightyear_examples_common.workspace = true
+lightyear = { path = "../../lightyear", features = [
+    "std",
+    "udp",
+    "netcode",
+    "webtransport",
+    "websocket",
+    "interpolation",
+    "prediction",
+    "replication",
+    "input_native",
+] }
 
 bevy_egui.workspace = true
 egui_extras.workspace = true
 serde.workspace = true
 tracing.workspace = true
-bevy.workspace = true
+clap.workspace = true
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "lobby"
-doc = false

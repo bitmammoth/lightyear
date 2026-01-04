@@ -1,77 +1,106 @@
+//! Protocol definitions for priority example.
+
+use bevy::math::Curve;
 use bevy::prelude::*;
-use leafwing_input_manager::action_state::ActionState;
-use leafwing_input_manager::input_map::InputMap;
-use leafwing_input_manager::prelude::Actionlike;
-use lightyear::input::leafwing::prelude::InputPlugin;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// Components
+// ============ Components ============
 
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct PlayerId(pub PeerId);
-
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut)]
-pub struct Position(pub(crate) Vec2);
+/// Position of a shape in the grid
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
+pub struct Position(pub Vec2);
 
 impl Ease for Position {
     fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
-        FunctionCurve::new(Interval::UNIT, move |t| {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
             Position(Vec2::lerp(start.0, end.0, t))
         })
     }
 }
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
-pub struct PlayerColor(pub(crate) Color);
-
-#[derive(Component, Deref, DerefMut)]
-pub struct ShapeChangeTimer(pub(crate) Timer);
-
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
+/// Shape type - cycles through Circle -> Triangle -> Square
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
 pub enum Shape {
     Circle,
     Triangle,
     Square,
 }
 
-// Channels
+/// Timer to cycle shape type
+#[derive(Component, Deref, DerefMut)]
+pub struct ShapeChangeTimer(pub Timer);
 
-pub struct Channel1;
+/// Player identifier
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerId(pub u64);
 
-// Messages
+/// Player color
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerColor(pub Color);
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Message1(pub usize);
+/// Player position (separate from grid Position)
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Reflect)]
+pub struct PlayerPosition(pub Vec2);
 
-// Inputs
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Reflect, Clone, Copy, Actionlike)]
-pub enum Inputs {
-    Up,
-    Down,
-    Left,
-    Right,
-    Delete,
+impl Ease for PlayerPosition {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        bevy::math::curve::FunctionCurve::new(bevy::math::curve::Interval::UNIT, move |t| {
+            PlayerPosition(Vec2::lerp(start.0, end.0, t))
+        })
+    }
 }
 
-// Protocol
-pub(crate) struct ProtocolPlugin;
+// ============ Inputs ============
+
+/// Direction input
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
+pub struct Direction {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Direction {
+    #[allow(dead_code)]
+    pub fn is_none(&self) -> bool {
+        !self.up && !self.down && !self.left && !self.right
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Reflect, Default)]
+pub enum Inputs {
+    #[default]
+    None,
+    Direction(Direction),
+}
+
+impl bevy::ecs::entity::MapEntities for Inputs {
+    fn map_entities<M: bevy::ecs::entity::EntityMapper>(&mut self, _entity_mapper: &mut M) {}
+}
+
+// ============ Protocol Plugin ============
+
+pub struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        app.register_type::<InputMap<Inputs>>();
-        app.register_type::<ActionState<Inputs>>();
-        // inputs
-        app.add_plugins(InputPlugin::<Inputs>::default());
-        // components
+        // Register inputs
+        app.add_plugins(lightyear::prelude::input::native::InputPlugin::<Inputs>::default());
+        
+        // Register components
         app.register_component::<PlayerId>();
-
+        app.register_component::<PlayerColor>();
+        app.register_component::<Shape>();
+        
+        // Position with interpolation (for grid shapes - no prediction needed)
         app.register_component::<Position>()
+            .add_linear_interpolation();
+        
+        // PlayerPosition with prediction and interpolation
+        app.register_component::<PlayerPosition>()
             .add_prediction()
             .add_linear_interpolation();
-
-        app.register_component::<PlayerColor>();
-
-        app.register_component::<Shape>();
     }
 }
