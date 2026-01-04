@@ -1204,6 +1204,12 @@ impl Replicate {
         if let Ok((sender_entity, remote_peer_id, _client, client_of)) =
             sender_query.get_mut(trigger.entity)
         {
+            info!(
+                "🔌 handle_connection for new client: sender_entity={}, remote_peer_id={:?}",
+                sender_entity, remote_peer_id
+            );
+            
+            let mut entity_count = 0;
             // TODO: maybe do this in parallel?
             replicate_query.iter_mut().for_each(
                 |HandleConnectionQueryDataItem {
@@ -1215,6 +1221,12 @@ impl Replicate {
                      interpolation,
                      mut state,
                  }| {
+                    entity_count += 1;
+                    info!(
+                        "🔌 Checking entity {} for new client {}, mode={:?}",
+                        entity, sender_entity, replicate.mode
+                    );
+                    
                     let state = &mut state;
                     let mut update_state = |mode: &ReplicationMode,
                                             f: fn(
@@ -1251,7 +1263,16 @@ impl Replicate {
                             #[cfg(feature = "server")]
                             ReplicationMode::Target(target) => {
                                 if target.targets(remote_peer_id) {
+                                    info!(
+                                        "✅ handle_connection: Target mode matches, adding sender {} to entity {}",
+                                        sender_entity, entity
+                                    );
                                     f(state, entity, sender_entity, &mut commands);
+                                } else {
+                                    info!(
+                                        "❌ handle_connection: Target mode does NOT match for entity {}",
+                                        entity
+                                    );
                                 }
                             }
                             ReplicationMode::Manual(entities) => {
