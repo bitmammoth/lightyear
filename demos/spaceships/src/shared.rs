@@ -13,8 +13,10 @@ use lightyear::avian2d::plugin::AvianReplicationMode;
 use lightyear::connection::client_of::ClientOf;
 use lightyear::input::leafwing::prelude::LeafwingSnapshot;
 use lightyear::prelude::*;
-use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
 use tracing::Level;
+
+// Fixed timestep - same as original spaceships
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
 
 pub(crate) const MAX_VELOCITY: f32 = 200.0;
 pub(crate) const WALL_SIZE: f32 = 350.0;
@@ -246,6 +248,7 @@ pub fn shared_player_firing(
 
         if is_server {
             #[cfg(feature = "server")]
+            // Multi-transport: use to_all instead of to_clients
             commands.entity(bullet_entity).insert((
                 Replicate::to_clients(NetworkTarget::All),
                 PredictionTarget::to_clients(NetworkTarget::All),

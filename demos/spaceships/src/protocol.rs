@@ -2,7 +2,7 @@ use avian2d::prelude::*;
 use bevy::prelude::*;
 use core::time::Duration;
 use leafwing_input_manager::prelude::*;
-use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
+use crate::shared::FIXED_TIMESTEP_HZ;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::color_from_id;

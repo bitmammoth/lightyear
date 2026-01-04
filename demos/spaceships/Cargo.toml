@@ -9,28 +9,39 @@ edition.workspace = true
 publish = false
 
 [features]
-default = ["client", "gui", "server", "netcode", "udp"]
-client = ["gui", "lightyear/client", "lightyear_examples_common/client"]
-gui = ["lightyear_examples_common/gui", "bevy/bevy_post_process"]
-server = ["lightyear/server", "lightyear_examples_common/server"]
-netcode = ["lightyear_examples_common/netcode"]
-udp = [
-  "lightyear_examples_common/udp",
-  # udp requires std
-  "lightyear/std",
-  "lightyear/udp",
+default = ["gui", "client", "server"]
+client = []
+server = []
+gui = [
+    "bevy/bevy_sprite_render",
+    "bevy/bevy_render",
+    "bevy/bevy_winit",
+    "bevy/bevy_window",
+    "bevy/default_font",
+    "bevy/x11",
+    "bevy/bevy_post_process",
+    "bevy/bevy_gizmos",
+    "bevy/bevy_text",
+    "bevy/bevy_core_pipeline",
+    "bevy/tonemapping_luts",
 ]
 
 [dependencies]
 lightyear = { workspace = true, features = [
+  "client",
+  "server",
   "interpolation",
   "prediction",
   "replication",
   "leafwing",
   "avian2d",
+  "std",
+  "netcode",
+  "udp",
+  "webtransport",
+  "websocket",
 ] }
 lightyear_frame_interpolation.workspace = true
-lightyear_examples_common.workspace = true
 leafwing-input-manager = { workspace = true, features = ["keyboard", "mouse"] }
 avian2d = { workspace = true, features = [
   "2d",
@@ -43,15 +54,11 @@ serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bevy = { workspace = true, features = ["bevy_state"] }
-
-[package.metadata.bevy_cli.web]
-rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
-default-features = false
-features = ["client", "netcode"]
+clap = { version = "4.0", features = ["derive"] }
+anyhow.workspace = true
 
 [lints]
 workspace = true
-
 
 [[bin]]
 name = "spaceships"

@@ -1,5 +1,7 @@
 use core::f32::consts::TAU;
+use core::net::Ipv4Addr;
 use std::env;
+use std::net::SocketAddr;
 use std::thread;
 
 use avian2d::prelude::*;
@@ -11,26 +13,41 @@ use core::time::Duration;
 use leafwing_input_manager::action_diff::ActionDiff;
 use leafwing_input_manager::prelude::*;
 use lightyear::connection::client::PeerMetadata;
+use lightyear::connection::server::Started;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
-use lightyear_examples_common::shared::{FIXED_TIMESTEP_HZ, SEND_INTERVAL};
 
+use crate::shared::FIXED_TIMESTEP_HZ;
 use crate::protocol::*;
 use crate::shared;
 use crate::shared::{apply_action_state_to_player_movement, color_from_id};
+
+// Port configuration for multi-transport
+pub const UDP_PORT: u16 = 5000;
+pub const WEBTRANSPORT_PORT: u16 = 5001;
+pub const WEBSOCKET_PORT: u16 = 5002;
+
+/// Send interval for replication - matches original spaceships (every 2 ticks)
+pub const SEND_INTERVAL: Duration = Duration::from_nanos((1_000_000_000.0 / FIXED_TIMESTEP_HZ * 2.0) as u64);
 
 // Plugin for server-specific logic
 pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
+        // Multi-transport startup
+        app.add_systems(Startup, startup);
+        // Original ball spawning
         app.add_systems(Startup, init);
 
         app.add_observer(handle_new_client);
         app.add_observer(handle_connections);
         app.add_systems(
             Update,
-            (update_player_metrics.run_if(on_timer(Duration::from_secs(1))),),
+            (
+                update_player_metrics.run_if(on_timer(Duration::from_secs(1))),
+                debug_positions.run_if(on_timer(Duration::from_secs(2))),
+            ),
         );
 
         app.add_systems(
@@ -48,6 +65,115 @@ impl Plugin for ExampleServerPlugin {
     }
 }
 
+/// Debug system to log all player positions
+fn debug_positions(
+    players: Query<(Entity, &Player, &Position, Option<&ControlledBy>)>,
+    links: Query<(Entity, &LinkOf, Option<&ReplicationSender>), With<ClientOf>>,
+    balls: Query<(Entity, &Position), With<BallMarker>>,
+) {
+    info!("=== SERVER PLAYER POSITIONS ===");
+    for (entity, player, pos, controlled_by) in players.iter() {
+        let owner = controlled_by.map(|c| format!("{:?}", c.owner)).unwrap_or("none".to_string());
+        info!("  Player {:?} '{}' pos=({:.1}, {:.1}) owner={}", 
+            entity, player.nickname, pos.0.x, pos.0.y, owner);
+    }
+    
+    info!("=== SERVER BALL POSITIONS ===");
+    for (entity, pos) in balls.iter() {
+        info!("  Ball {:?} pos=({:.1}, {:.1})", entity, pos.0.x, pos.0.y);
+    }
+    
+    info!("=== SERVER CLIENT LINKS ===");
+    for (entity, link_of, repl_sender) in links.iter() {
+        let has_sender = repl_sender.is_some();
+        info!("  Link {:?} -> Server {:?}, has_replication_sender={}", 
+            entity, link_of.server, has_sender);
+    }
+}
+
+/// Multi-transport server startup - creates ONE Server entity with multiple transports
+fn startup(mut commands: Commands) -> Result {
+    info!("\n=== Multi-Transport Spaceships Server Starting ===\n");
+
+    // 1. Spawn ONE logical server - all clients will have LinkOf pointing here
+    let server = commands
+        .spawn((
+            Server::default(),
+            Name::new("SpaceshipsServer"),
+        ))
+        .id();
+    info!("🎯 Spawned logical Server entity: {:?}", server);
+
+    // 2. UDP Transport - feeds connections to the server
+    let udp_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), UDP_PORT);
+    let udp_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(udp_addr),
+            ServerUdpIo::default(),
+            TransportOf::new(server),  // Points to our server
+            Name::new("UdpTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: udp_transport });
+    info!("📡 UDP transport starting on port {} -> Server {:?}", UDP_PORT, server);
+
+    // 3. WebTransport - also feeds connections to the SAME server
+    let wt_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBTRANSPORT_PORT);
+    let sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let identity = Identity::self_signed(sans).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    info!("🔐 WebTransport certificate digest: {}", digest);
+    
+    let wt_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(wt_addr),
+            WebTransportServerIo { certificate: identity },
+            TransportOf::new(server),  // Same server!
+            Name::new("WebTransportTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: wt_transport });
+    info!("🌐 WebTransport transport starting on port {} -> Server {:?}", WEBTRANSPORT_PORT, server);
+
+    // 4. WebSocket - third transport, also feeds connections to the SAME server
+    let ws_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEBSOCKET_PORT);
+    let sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let ws_config = lightyear::websocket::server::ServerConfig::builder()
+        .with_bind_address(ws_addr)
+        .with_identity(lightyear::websocket::server::Identity::self_signed(sans).unwrap());
+    let ws_transport = commands
+        .spawn((
+            NetcodeServer::new(NetcodeConfig::default()),
+            LocalAddr(ws_addr),
+            WebSocketServerIo { config: ws_config },
+            TransportOf::new(server),  // Same server!
+            Name::new("WebSocketTransport"),
+        ))
+        .id();
+    commands.trigger(Start { entity: ws_transport });
+    info!("🔌 WebSocket transport starting on port {} -> Server {:?}", WEBSOCKET_PORT, server);
+
+    // 5. Manually add Started to the Server entity
+    // In single-transport setups, Start trigger adds Started automatically because Server has NetcodeServer.
+    // In multi-transport, the Server entity doesn't have NetcodeServer (only transports do),
+    // so we need to add Started manually to enable input processing.
+    commands.entity(server).insert(Started);
+    info!("🚀 Server entity {:?} marked as Started", server);
+
+    info!("\n✅ Server initialized with 3 transports. All clients connect to Server {:?}\n", server);
+    Ok(())
+}
+
 /// Since Player is replicated, this allows the clients to display remote players' latency stats.
 fn update_player_metrics(
     links: Query<&Link, With<LinkOf>>,
@@ -62,7 +188,7 @@ fn update_player_metrics(
 }
 
 fn init(mut commands: Commands) {
-    // the balls are server-authoritative
+    // the balls are server-authoritative (matches original spaceships)
     const NUM_BALLS: usize = 6;
     for i in 0..NUM_BALLS {
         let radius = 10.0 + i as f32 * 4.0;
@@ -75,6 +201,7 @@ fn init(mut commands: Commands) {
             ball.physics_bundle(),
             ball,
             Name::new("Ball"),
+            // Multi-transport: use to_all instead of to_clients
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::All),
         ));
@@ -83,6 +210,7 @@ fn init(mut commands: Commands) {
 
 /// Add the ReplicationSender component to new clients
 pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    info!("🔗 Adding ReplicationSender to new client link: {:?}", trigger.entity);
     commands
         .entity(trigger.entity)
         .insert(ReplicationSender::new(
@@ -125,6 +253,7 @@ pub(crate) fn handle_connections(
         let y = 200.0 * angle.sin();
 
         // spawn the player with ActionState - the client will add their own InputMap
+        // Multi-transport: use to_all instead of to_clients
         let player_ent = commands
             .spawn((
                 Player::new(client_id, pick_player_name(client_id.to_bits())),
